@@ -3,10 +3,13 @@ import * as ec2 from 'aws-cdk-lib/aws-ec2';
 import * as ecr from 'aws-cdk-lib/aws-ecr';
 import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
+import * as route53 from 'aws-cdk-lib/aws-route53';
+import * as targets from 'aws-cdk-lib/aws-route53-targets';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import { Construct } from 'constructs';
 import { DataStack } from './data-stack';
+import { DnsStack, HARNESS_DOMAIN } from './dns-stack';
 import {
   FINERACT_CONTEXT,
   FINERACT_PORT,
@@ -17,6 +20,7 @@ import {
 
 export interface AppStackProps extends cdk.StackProps {
   data: DataStack;
+  dns: DnsStack;
   fineractRepo: ecr.IRepository;
   fineractImageTag: string;
   /** 0 until db-init has run once, then 1. Context `fineractDesiredCount` overrides the default of 1. */
@@ -28,6 +32,7 @@ export class AppStack extends cdk.Stack {
   public readonly fineractService: ecs.FargateService;
   public readonly alb: elbv2.ApplicationLoadBalancer;
   public readonly listener: elbv2.ApplicationListener;
+  public readonly httpListener: elbv2.ApplicationListener;
   public readonly fineractAdminSecret: secretsmanager.Secret;
   public readonly dbInitTaskDef: ecs.FargateTaskDefinition;
 
@@ -145,9 +150,21 @@ export class AppStack extends cdk.Stack {
       securityGroup: data.albSg,
       vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
     });
-    this.listener = this.alb.addListener('Http', {
+    // HTTP only redirects to HTTPS; all routing lives on the 443 listener.
+    this.httpListener = this.alb.addListener('Http', {
       port: 80,
       protocol: elbv2.ApplicationProtocol.HTTP,
+      open: false,
+      defaultAction: elbv2.ListenerAction.redirect({
+        protocol: elbv2.ApplicationProtocol.HTTPS,
+        port: '443',
+        permanent: true,
+      }),
+    });
+    this.listener = this.alb.addListener('Https', {
+      port: 443,
+      protocol: elbv2.ApplicationProtocol.HTTPS,
+      certificates: [props.dns.certificate],
       open: false,
       defaultAction: elbv2.ListenerAction.fixedResponse(404, {
         contentType: 'text/plain',
@@ -174,6 +191,12 @@ export class AppStack extends cdk.Stack {
       priority: 10,
       conditions: [elbv2.ListenerCondition.pathPatterns([`${FINERACT_CONTEXT}/*`])],
       action: elbv2.ListenerAction.forward([tg]),
+    });
+
+    new route53.ARecord(this, 'DomainAlias', {
+      zone: props.dns.zone,
+      recordName: HARNESS_DOMAIN,
+      target: route53.RecordTarget.fromAlias(new targets.LoadBalancerTarget(this.alb)),
     });
 
     new cdk.CfnOutput(this, 'AlbDnsName', { value: this.alb.loadBalancerDnsName });

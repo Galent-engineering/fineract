@@ -41,12 +41,9 @@ describe('DataStack', () => {
   test('albSg port 80 ingress is exactly the context CIDRs', () => {
     const { template } = synth();
     const [, sg] = sgByDesc(template, 'ALB');
-    const ing = sg.Properties.SecurityGroupIngress as any[];
+    const ing = (sg.Properties.SecurityGroupIngress as any[]).filter((i) => i.FromPort === 80);
     expect(ing.map((i) => i.CidrIp).sort()).toEqual([...CIDRS].sort());
-    for (const i of ing) {
-      expect(i.FromPort).toBe(80);
-      expect(i.ToPort).toBe(80);
-    }
+    for (const i of ing) expect(i.ToPort).toBe(80);
   });
 
   test('dbSg 5432 ingress is the context CIDRs plus tasksSg', () => {

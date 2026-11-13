@@ -48,6 +48,7 @@ export class DataStack extends cdk.Stack {
 
     for (const cidr of props.allowedCidrs) {
       this.albSg.addIngressRule(ec2.Peer.ipv4(cidr), ec2.Port.tcp(80), 'allow-listed HTTP');
+      this.albSg.addIngressRule(ec2.Peer.ipv4(cidr), ec2.Port.tcp(443), 'allow-listed HTTPS');
       this.dbSg.addIngressRule(ec2.Peer.ipv4(cidr), ec2.Port.tcp(5432), 'allow-listed Postgres');
     }
     this.dbSg.addIngressRule(this.tasksSg, ec2.Port.tcp(5432), 'ECS tasks to Postgres');

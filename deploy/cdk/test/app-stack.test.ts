@@ -3,6 +3,7 @@ import { Template, Match } from 'aws-cdk-lib/assertions';
 import { loadHarnessConfig } from '../lib/config';
 import { BuildStack } from '../lib/build-stack';
 import { DataStack } from '../lib/data-stack';
+import { DnsStack } from '../lib/dns-stack';
 import { AppStack } from '../lib/app-stack';
 
 const synth = () => {
@@ -11,9 +12,11 @@ const synth = () => {
   const env = { account: '111111111111', region: 'us-east-1' };
   const build = new BuildStack(app, 'HarnessBuild', { env });
   const data = new DataStack(app, 'HarnessData', { env, allowedCidrs: config.allowedCidrs });
+  const dns = new DnsStack(app, 'HarnessDns', { env });
   const stack = new AppStack(app, 'HarnessApp', {
     env,
     data,
+    dns,
     fineractRepo: build.fineractRepo,
     fineractImageTag: 'abc123',
   });
