@@ -18,6 +18,14 @@ import {
   fineractEnvironment,
 } from './fineract-env';
 
+/**
+ * Mifos web app. Docker Hub has no 1.15.x/1.16.x tag (only `1.14`, amd64-only, plus `dev*`/`master*`);
+ * pinned by digest so the mutable tag cannot drift. Recorded 2026-11-13.
+ */
+export const WEBAPP_IMAGE =
+  'openmf/web-app:1.14@sha256:3a6c14ee8e5be90169ab2f7418035f6bab027d6b44dd8dfb0237560a47f69551';
+const WEBAPP_PORT = 80;
+
 export interface AppStackProps extends cdk.StackProps {
   data: DataStack;
   dns: DnsStack;
@@ -30,6 +38,7 @@ export interface AppStackProps extends cdk.StackProps {
 export class AppStack extends cdk.Stack {
   public readonly cluster: ecs.Cluster;
   public readonly fineractService: ecs.FargateService;
+  public readonly webappService: ecs.FargateService;
   public readonly alb: elbv2.ApplicationLoadBalancer;
   public readonly listener: elbv2.ApplicationListener;
   public readonly httpListener: elbv2.ApplicationListener;
@@ -161,15 +170,57 @@ export class AppStack extends cdk.Stack {
         permanent: true,
       }),
     });
+
+    // ---- Mifos web app: ALB default route on the HTTPS listener ----
+    const webTaskDef = new ecs.FargateTaskDefinition(this, 'WebappTaskDef', {
+      family: 'harness-webapp',
+      cpu: 256,
+      memoryLimitMiB: 512,
+      runtimePlatform: { cpuArchitecture: ecs.CpuArchitecture.X86_64, operatingSystemFamily: ecs.OperatingSystemFamily.LINUX },
+    });
+    const apiUrl = `https://${HARNESS_DOMAIN}`;
+    webTaskDef.addContainer('webapp', {
+      image: ecs.ContainerImage.fromRegistry(WEBAPP_IMAGE),
+      portMappings: [{ containerPort: WEBAPP_PORT }],
+      environment: {
+        FINERACT_API_URL: apiUrl,
+        FINERACT_API_URLS: apiUrl,
+        FINERACT_API_PROVIDER: `${FINERACT_CONTEXT}/api`,
+        FINERACT_API_VERSION: '/v1',
+        FINERACT_API_ACTUATOR: FINERACT_CONTEXT,
+        FINERACT_PLATFORM_TENANT_IDENTIFIER: 'default',
+        FINERACT_PLATFORM_TENANTS_IDENTIFIER: 'default',
+      },
+      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'webapp', logRetention: logs.RetentionDays.ONE_WEEK }),
+    });
+    this.webappService = new ecs.FargateService(this, 'WebappService', {
+      serviceName: 'webapp',
+      cluster: this.cluster,
+      taskDefinition: webTaskDef,
+      desiredCount: 1,
+      assignPublicIp: true,
+      vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
+      securityGroups: [data.tasksSg],
+      minHealthyPercent: 0,
+      maxHealthyPercent: 100,
+    });
+    // The target group's connections add the ALB -> tasks :80 ingress rule automatically.
+    const webTg = new elbv2.ApplicationTargetGroup(this, 'WebappTg', {
+      vpc: data.vpc,
+      port: WEBAPP_PORT,
+      protocol: elbv2.ApplicationProtocol.HTTP,
+      targetType: elbv2.TargetType.IP,
+      targets: [this.webappService],
+      healthCheck: { path: '/', healthyHttpCodes: '200' },
+      deregistrationDelay: cdk.Duration.seconds(30),
+    });
+
     this.listener = this.alb.addListener('Https', {
       port: 443,
       protocol: elbv2.ApplicationProtocol.HTTPS,
       certificates: [props.dns.certificate],
       open: false,
-      defaultAction: elbv2.ListenerAction.fixedResponse(404, {
-        contentType: 'text/plain',
-        messageBody: 'not found',
-      }),
+      defaultAction: elbv2.ListenerAction.forward([webTg]),
     });
     const tg = new elbv2.ApplicationTargetGroup(this, 'FineractTg', {
       vpc: data.vpc,

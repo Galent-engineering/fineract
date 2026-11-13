@@ -82,7 +82,40 @@ describe('AppStack', () => {
     expect(c.Secrets.length).toBeGreaterThanOrEqual(2);
   });
 
-  test('no secret values in template', () => {
+  test('webapp: pinned openmf/web-app image, 256/512, X86_64, env points at the HTTPS domain', () => {
+    const def = byFamilyPrefix(t, 'webapp');
+    expect(def.Properties.Cpu).toBe('256');
+    expect(def.Properties.Memory).toBe('512');
+    expect(def.Properties.RuntimePlatform.CpuArchitecture).toBe('X86_64');
+    const c = def.Properties.ContainerDefinitions[0];
+    expect(c.Image).toMatch(/^openmf\/web-app:1\.\d+(\.\d+)?@sha256:[0-9a-f]{64}$/);
+    const env = Object.fromEntries((c.Environment ?? []).map((e: any) => [e.Name, e.Value]));
+    expect(env.FINERACT_API_URL).toBe('https://fineract.galent.ai');
+    expect(env.FINERACT_API_URLS).toBe('https://fineract.galent.ai');
+    expect(env.FINERACT_PLATFORM_TENANT_IDENTIFIER).toBe('default');
+    expect(env.FINERACT_API_PROVIDER).toBe('/fineract-provider/api');
+    expect(env.FINERACT_API_VERSION).toBe('/v1');
+    expect(env.FINERACT_API_ACTUATOR).toBe('/fineract-provider');
+    expect(c.Secrets ?? []).toEqual([]);
+  });
+
+  test('HTTPS listener default action forwards to the webapp target group', () => {
+    const listeners = Object.values(t.findResources('AWS::ElasticLoadBalancingV2::Listener'));
+    const https = listeners.find((l: any) => l.Properties.Port === 443) as any;
+    const action = https.Properties.DefaultActions[0];
+    expect(action.Type).toBe('forward');
+    const tgs = t.findResources('AWS::ElasticLoadBalancingV2::TargetGroup');
+    const tgId = action.TargetGroupArn.Ref;
+    expect(tgs[tgId].Properties.Port).toBe(80);
+  });
+
+  test('port 80 listener still only redirects to HTTPS', () => {
+    const listeners = Object.values(t.findResources('AWS::ElasticLoadBalancingV2::Listener'));
+    const http = listeners.find((l: any) => l.Properties.Port === 80) as any;
+    expect(http.Properties.DefaultActions[0].Type).toBe('redirect');
+  });
+
+    test('no secret values in template', () => {
     expect(JSON.stringify(t.toJSON())).not.toMatch(/"SecretString"\s*:\s*"[^{]/);
   });
 });
