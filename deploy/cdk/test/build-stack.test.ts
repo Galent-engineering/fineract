@@ -18,7 +18,7 @@ describe('BuildStack', () => {
             Condition: Match.objectLike({
               StringEquals: Match.objectLike({
                 'token.actions.githubusercontent.com:sub':
-                  'repo:Galent-engineering/fineract:ref:refs/heads/galent/reliability-harness',
+                  'repo:Galent-engineering@219138393/fineract@1456802084:ref:refs/heads/galent/reliability-harness',
               }),
             }),
           }),

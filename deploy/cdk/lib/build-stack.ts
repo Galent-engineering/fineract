@@ -3,7 +3,8 @@ import * as ecr from 'aws-cdk-lib/aws-ecr';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import { Construct } from 'constructs';
 
-const GITHUB_REPO = 'Galent-engineering/fineract';
+// Org uses immutable OIDC subject claims (owner/repo ids), not names.
+const GITHUB_SUB_PREFIX = 'repo:Galent-engineering@219138393/fineract@1456802084';
 const GITHUB_BRANCH = 'galent/reliability-harness';
 
 export class BuildStack extends cdk.Stack {
@@ -39,7 +40,7 @@ export class BuildStack extends cdk.Stack {
         {
           StringEquals: {
             'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com',
-            'token.actions.githubusercontent.com:sub': `repo:${GITHUB_REPO}:ref:refs/heads/${GITHUB_BRANCH}`,
+            'token.actions.githubusercontent.com:sub': `${GITHUB_SUB_PREFIX}:ref:refs/heads/${GITHUB_BRANCH}`,
           },
         },
         'sts:AssumeRoleWithWebIdentity',
