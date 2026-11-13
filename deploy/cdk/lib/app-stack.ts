@@ -40,6 +40,7 @@ export class AppStack extends cdk.Stack {
     // Rotated into Fineract by Task 8; username matches the spec.
     this.fineractAdminSecret = new secretsmanager.Secret(this, 'FineractAdminSecret', {
       secretName: 'harness/fineract/admin',
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
       generateSecretString: {
         secretStringTemplate: JSON.stringify({ username: 'harness_admin' }),
         generateStringKey: 'password',
@@ -50,6 +51,7 @@ export class AppStack extends cdk.Stack {
     // Replaces Fineract's default tenant master password ("fineract").
     const masterSecret = new secretsmanager.Secret(this, 'FineractMasterSecret', {
       secretName: 'harness/fineract/master',
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
       generateSecretString: { passwordLength: 32, excludePunctuation: true },
     });
 

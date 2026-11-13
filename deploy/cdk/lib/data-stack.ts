@@ -72,11 +72,13 @@ export class DataStack extends cdk.Stack {
       deletionProtection: false,
       removalPolicy: cdk.RemovalPolicy.SNAPSHOT,
     });
+    this.db.secret!.applyRemovalPolicy(cdk.RemovalPolicy.DESTROY);
     this.dbAdminSecret = this.db.secret!;
 
     const userSecret = (logicalId: string, name: string, username: string) =>
       new secretsmanager.Secret(this, logicalId, {
         secretName: name,
+        removalPolicy: cdk.RemovalPolicy.DESTROY,
         generateSecretString: {
           secretStringTemplate: JSON.stringify({ username }),
           generateStringKey: 'password',

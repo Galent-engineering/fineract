@@ -5,3 +5,4 @@ dist/
 !jest.config.js
 *.d.ts
 !bin/
+cdk.context.json

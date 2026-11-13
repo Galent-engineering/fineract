@@ -23,6 +23,13 @@ const sgByDesc = (t: Template, fragment: string) => {
 };
 
 describe('DataStack', () => {
+  test('all harness secrets are deleted with the stack', () => {
+    const { template } = synth();
+    const secrets = template.findResources('AWS::SecretsManager::Secret');
+    expect(Object.keys(secrets).length).toBeGreaterThanOrEqual(3);
+    for (const r of Object.values(secrets)) expect((r as any).DeletionPolicy).toBe('Delete');
+  });
+
   test('no NAT gateways, public subnets only, 2 AZs', () => {
     const { template } = synth();
     template.resourceCountIs('AWS::EC2::NatGateway', 0);
