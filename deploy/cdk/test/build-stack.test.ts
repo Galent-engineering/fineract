@@ -29,23 +29,27 @@ describe('BuildStack', () => {
 
   const BRANCH_SUB = 'repo:Galent-engineering@219138393/fineract@1456802084:ref:refs/heads/galent/reliability-harness';
 
-  test('deploy role (harness-github-deploy) has the same immutable branch-pinned trust', () => {
-    synth().hasResourceProperties('AWS::IAM::Role', {
-      RoleName: 'harness-github-deploy',
-      AssumeRolePolicyDocument: Match.objectLike({
-        Statement: Match.arrayWith([
-          Match.objectLike({
-            Action: 'sts:AssumeRoleWithWebIdentity',
-            Condition: {
-              StringEquals: {
-                'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com',
-                'token.actions.githubusercontent.com:sub': BRANCH_SUB,
-              },
-            },
-          }),
-        ]),
-      }),
-    });
+  const ENV_SUB = 'repo:Galent-engineering@219138393/fineract@1456802084:environment:harness-deploy';
+  const subOf = (roleName: string) => {
+    const role: any = Object.values(synth().findResources('AWS::IAM::Role')).find((r: any) => r.Properties.RoleName === roleName);
+    const stmts = role.Properties.AssumeRolePolicyDocument.Statement;
+    expect(stmts).toHaveLength(1);
+    expect(stmts[0].Action).toBe('sts:AssumeRoleWithWebIdentity');
+    return stmts[0].Condition.StringEquals;
+  };
+
+  test('build role trusts exactly the branch subject, not the environment one', () => {
+    const c = subOf('harness-github-ci');
+    expect(c['token.actions.githubusercontent.com:sub']).toBe(BRANCH_SUB);
+    expect(c['token.actions.githubusercontent.com:aud']).toBe('sts.amazonaws.com');
+    expect(JSON.stringify(c)).not.toContain('environment:');
+  });
+
+  test('deploy role trusts exactly the harness-deploy environment subject, not the branch one', () => {
+    const c = subOf('harness-github-deploy');
+    expect(c['token.actions.githubusercontent.com:sub']).toBe(ENV_SUB);
+    expect(c['token.actions.githubusercontent.com:aud']).toBe('sts.amazonaws.com');
+    expect(JSON.stringify(c)).not.toContain('ref:refs');
   });
 
   // statements attached to the role whose RoleName is `name`

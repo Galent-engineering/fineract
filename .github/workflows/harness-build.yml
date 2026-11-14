@@ -71,6 +71,8 @@ jobs:
     if: github.event_name == 'push' && github.ref == 'refs/heads/galent/reliability-harness' && vars.HARNESS_DEPLOY == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # Its OIDC token carries the environment subject, which only harness-github-deploy trusts.
+    environment: harness-deploy
     permissions:
       id-token: write
       contents: read

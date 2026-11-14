@@ -6,6 +6,7 @@ import { Construct } from 'constructs';
 // Org uses immutable OIDC subject claims (owner/repo ids), not names.
 const GITHUB_SUB_PREFIX = 'repo:Galent-engineering@219138393/fineract@1456802084';
 const GITHUB_BRANCH = 'galent/reliability-harness';
+const DEPLOY_ENVIRONMENT = 'harness-deploy';
 
 export class BuildStack extends cdk.Stack {
   public readonly fineractRepo: ecr.Repository;
@@ -39,13 +40,13 @@ export class BuildStack extends cdk.Stack {
       thumbprintList: ['6938fd4d98bab03faadb97b34396831e3780aea1'],
     });
 
-    const githubTrust = () =>
+    const githubTrust = (sub: string) =>
       new iam.FederatedPrincipal(
         provider.attrArn,
         {
           StringEquals: {
             'token.actions.githubusercontent.com:aud': 'sts.amazonaws.com',
-            'token.actions.githubusercontent.com:sub': `${GITHUB_SUB_PREFIX}:ref:refs/heads/${GITHUB_BRANCH}`,
+            'token.actions.githubusercontent.com:sub': sub,
           },
         },
         'sts:AssumeRoleWithWebIdentity',
@@ -54,13 +55,14 @@ export class BuildStack extends cdk.Stack {
     // Build job (Gradle, Maven dependencies, docker): ECR push/pull only.
     this.ciRole = new iam.Role(this, 'CiRole', {
       roleName: 'harness-github-ci',
-      assumedBy: githubTrust(),
+      assumedBy: githubTrust(`${GITHUB_SUB_PREFIX}:ref:refs/heads/${GITHUB_BRANCH}`),
       maxSessionDuration: cdk.Duration.hours(1),
     });
-    // Deploy job (cdk + npm): separate role so build-time code never holds the CDK deploy permissions.
+    // Deploy job (cdk + npm): separate role, trusted only for tokens of the `harness-deploy` GitHub environment
+    // (the deploy job declares it), so a token minted in the build job cannot assume it.
     this.deployRole = new iam.Role(this, 'DeployRole', {
       roleName: 'harness-github-deploy',
-      assumedBy: githubTrust(),
+      assumedBy: githubTrust(`${GITHUB_SUB_PREFIX}:environment:${DEPLOY_ENVIRONMENT}`),
       maxSessionDuration: cdk.Duration.hours(1),
     });
 

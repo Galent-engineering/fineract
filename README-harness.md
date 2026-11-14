@@ -208,10 +208,12 @@ this README, runs nothing), and on manual dispatch. Runs are serialised per ref 
   It installs the CDK app (`npm ci --ignore-scripts`, before any credential exists), assumes `harness-github-deploy`
   (variable `HARNESS_DEPLOY_ROLE_ARN`), and runs `cdk deploy HarnessApp --exclusively` with
   `fineractImageTag=<commit sha>` and `trafficImageTag=<commit sha>`, then waits for `aws ecs wait services-stable`.
-- Both roles trust the OIDC subject of this branch (immutable-id form); `harness-github-deploy` can only assume the
-  CDK bootstrap roles and describe ECS services. Because both roles share one trust subject, the split limits what
-  each role's *policy* grants, not who can ask for it: a step in the build job could still request the deploy role.
-  Moving the deploy job to a GitHub environment (subject `...:environment:harness-deploy`) would close that.
+- The two roles trust different OIDC subjects (immutable-id form, prefix `repo:Galent-engineering@219138393/fineract@1456802084`):
+  `harness-github-ci` only `...:ref:refs/heads/galent/reliability-harness` (the build job), `harness-github-deploy`
+  only `...:environment:harness-deploy` (the deploy job declares `environment: harness-deploy`). A token minted in the
+  build job therefore cannot assume the deploy role, and the deploy job's token cannot assume the build role. The
+  GitHub environment `harness-deploy` has a deployment branch policy allowing only `galent/reliability-harness` and no
+  required reviewers. `harness-github-deploy` can only assume the CDK bootstrap roles and describe ECS services.
   The CFN execution role from bootstrap is broad by default; this is accepted for the dev account.
 - ECR keeps the newest 30 images per repo and expires untagged manifests after 7 days.
 
