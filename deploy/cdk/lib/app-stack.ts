@@ -5,7 +5,11 @@ import * as ecs from 'aws-cdk-lib/aws-ecs';
 import * as elbv2 from 'aws-cdk-lib/aws-elasticloadbalancingv2';
 import * as route53 from 'aws-cdk-lib/aws-route53';
 import * as targets from 'aws-cdk-lib/aws-route53-targets';
+import * as iam from 'aws-cdk-lib/aws-iam';
 import * as logs from 'aws-cdk-lib/aws-logs';
+import * as aps from 'aws-cdk-lib/aws-aps';
+import * as fs from 'fs';
+import * as path from 'path';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import { Construct } from 'constructs';
 import { DataStack } from './data-stack';
@@ -16,6 +20,7 @@ import {
   TENANTS_DB,
   TENANT_DEFAULT_DB,
   fineractEnvironment,
+  substituteToken,
 } from './fineract-env';
 
 /**
@@ -25,6 +30,19 @@ import {
 export const WEBAPP_IMAGE =
   'openmf/web-app:1.14@sha256:3a6c14ee8e5be90169ab2f7418035f6bab027d6b44dd8dfb0237560a47f69551';
 const WEBAPP_PORT = 80;
+
+/** Telemetry sidecar images, pinned 2026-11-13. */
+export const ADOT_IMAGE = 'public.ecr.aws/aws-observability/aws-otel-collector:v0.51.0';
+export const FLUENT_BIT_IMAGE = 'public.ecr.aws/aws-observability/aws-for-fluent-bit:3.5.7';
+/**
+ * Fineract 1.16.1 ships no micrometer-tracing/OTel bridge (only micrometer-registry-otlp for metrics), so
+ * the FINERACT_MANAGEMENT_TRACIING_ENABLED / MANAGEMENT_OTLP_TRACING_* settings produce no spans.
+ * Spans come from the ADOT Java agent, copied into a shared volume by an init container and attached via
+ * JAVA_TOOL_OPTIONS (no Fineract source change).
+ */
+export const ADOT_JAVA_AGENT_IMAGE = 'public.ecr.aws/aws-observability/adot-autoinstrumentation-java:v2.33.0';
+const SIDECAR_CONFIG_WRITER_IMAGE = 'busybox:1.37.0';
+const readConfig = (file: string): string => fs.readFileSync(path.join(__dirname, '..', 'config', file), 'utf8');
 
 export interface AppStackProps extends cdk.StackProps {
   data: DataStack;
@@ -44,6 +62,8 @@ export class AppStack extends cdk.Stack {
   public readonly httpListener: elbv2.ApplicationListener;
   public readonly fineractAdminSecret: secretsmanager.Secret;
   public readonly dbInitTaskDef: ecs.FargateTaskDefinition;
+  /** Created here (not in ObsStack) because Fineract's task needs it and ObsStack depends on this stack. */
+  public readonly ampWorkspace: aps.CfnWorkspace;
 
   constructor(scope: Construct, id: string, props: AppStackProps) {
     super(scope, id, props);
@@ -114,10 +134,44 @@ export class AppStack extends cdk.Stack {
       memoryLimitMiB: 8192,
       runtimePlatform: { cpuArchitecture: ecs.CpuArchitecture.X86_64, operatingSystemFamily: ecs.OperatingSystemFamily.LINUX },
     });
-    taskDef.addContainer('fineract', {
+    this.ampWorkspace = new aps.CfnWorkspace(this, 'AmpWorkspace', { alias: 'harness' });
+    const fineractLogGroup = new logs.LogGroup(this, 'FineractLogGroup', {
+      logGroupName: '/harness/fineract',
+      retention: logs.RetentionDays.TWO_WEEKS,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+    taskDef.taskRole.addToPrincipalPolicy(
+      new iam.PolicyStatement({ actions: ['aps:RemoteWrite'], resources: [this.ampWorkspace.attrArn] }),
+    );
+    taskDef.taskRole.addToPrincipalPolicy(
+      new iam.PolicyStatement({
+        actions: [
+          'xray:PutTraceSegments',
+          'xray:PutTelemetryRecords',
+          'xray:GetSamplingRules',
+          'xray:GetSamplingTargets',
+          'xray:GetSamplingStatisticSummaries',
+        ],
+        resources: ['*'],
+      }),
+    );
+    fineractLogGroup.grantWrite(taskDef.taskRole);
+
+    taskDef.addVolume({ name: 'otel' });
+    const fineractContainer = taskDef.addContainer('fineract', {
       image: ecs.ContainerImage.fromEcrRepository(props.fineractRepo, props.fineractImageTag),
       portMappings: [{ containerPort: FINERACT_PORT }],
-      environment: fineractEnvironment(dbHost),
+      environment: {
+        ...fineractEnvironment(dbHost),
+        JAVA_TOOL_OPTIONS: '-Xmx5g -javaagent:/otel/javaagent.jar',
+        OTEL_SERVICE_NAME: 'fineract',
+        OTEL_EXPORTER_OTLP_ENDPOINT: 'http://localhost:4318',
+        OTEL_EXPORTER_OTLP_PROTOCOL: 'http/protobuf',
+        OTEL_TRACES_SAMPLER: 'always_on',
+        OTEL_METRICS_EXPORTER: 'none',
+        OTEL_LOGS_EXPORTER: 'none',
+        OTEL_AWS_APPLICATION_SIGNALS_ENABLED: 'false',
+      },
       secrets: {
         FINERACT_HIKARI_USERNAME: pw(data.fineractDbSecret, 'username'),
         FINERACT_HIKARI_PASSWORD: pw(data.fineractDbSecret, 'password'),
@@ -125,8 +179,58 @@ export class AppStack extends cdk.Stack {
         FINERACT_DEFAULT_TENANTDB_PWD: pw(data.fineractDbSecret, 'password'),
         FINERACT_DEFAULT_TENANTDB_MASTER_PASSWORD: ecs.Secret.fromSecretsManager(masterSecret),
       },
-      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'fineract', logRetention: logs.RetentionDays.TWO_WEEKS }),
+      logging: ecs.LogDrivers.firelens({ options: {} }),
     });
+    const otelInit = taskDef.addContainer('otel_agent_init', {
+      image: ecs.ContainerImage.fromRegistry(ADOT_JAVA_AGENT_IMAGE),
+      essential: false,
+      command: ['cp', '/javaagent.jar', '/otel/javaagent.jar'],
+      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'otel-agent-init', logRetention: logs.RetentionDays.ONE_WEEK }),
+    });
+    otelInit.addMountPoints({ containerPath: '/otel', sourceVolume: 'otel', readOnly: false });
+
+    fineractContainer.addMountPoints({ containerPath: '/otel', sourceVolume: 'otel', readOnly: true });
+    fineractContainer.addContainerDependencies({ container: otelInit, condition: ecs.ContainerDependencyCondition.SUCCESS });
+
+    // ADOT: scrapes Prometheus -> AMP (SigV4); OTLP :4318 -> X-Ray + Tempo.
+    taskDef.addContainer('adot', {
+      image: ecs.ContainerImage.fromRegistry(ADOT_IMAGE),
+      essential: false,
+      environment: {
+        AOT_CONFIG_CONTENT: substituteToken(
+          readConfig('adot-collector.yaml'),
+          '__AMP_ENDPOINT__',
+          this.ampWorkspace.attrPrometheusEndpoint,
+        ),
+      },
+      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'adot', logRetention: logs.RetentionDays.ONE_WEEK }),
+    });
+
+    // FireLens log router: custom fluent-bit config written to a shared volume by a one-shot init.
+    taskDef.addVolume({ name: 'fbcfg' });
+    const fbInit = taskDef.addContainer('fb_config_init', {
+      image: ecs.ContainerImage.fromRegistry(SIDECAR_CONFIG_WRITER_IMAGE),
+      essential: false,
+      entryPoint: ['/bin/sh', '-c'],
+      command: ['printf "%s" "$FLUENT_BIT_CONF" > /fbcfg/fluent-bit.conf && chmod a+r /fbcfg/fluent-bit.conf'],
+      environment: { FLUENT_BIT_CONF: readConfig('fluent-bit.conf') },
+      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'fb-config-init', logRetention: logs.RetentionDays.ONE_WEEK }),
+    });
+    fbInit.addMountPoints({ containerPath: '/fbcfg', sourceVolume: 'fbcfg', readOnly: false });
+    const router = taskDef.addFirelensLogRouter('log_router', {
+      image: ecs.ContainerImage.fromRegistry(FLUENT_BIT_IMAGE),
+      firelensConfig: {
+        type: ecs.FirelensLogRouterType.FLUENTBIT,
+        options: {
+          enableECSLogMetadata: false,
+          configFileType: ecs.FirelensConfigFileType.FILE,
+          configFileValue: '/fbcfg/fluent-bit.conf',
+        },
+      },
+      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'log-router', logRetention: logs.RetentionDays.ONE_WEEK }),
+    });
+    router.addMountPoints({ containerPath: '/fbcfg', sourceVolume: 'fbcfg', readOnly: true });
+    router.addContainerDependencies({ container: fbInit, condition: ecs.ContainerDependencyCondition.SUCCESS });
 
     const desired =
       props.fineractDesiredCount ?? Number(this.node.tryGetContext('fineractDesiredCount') ?? 1);

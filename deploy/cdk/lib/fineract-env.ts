@@ -9,6 +9,8 @@
  *                        server.port <- FINERACT_SERVER_PORT (default 8443)
  *  - Tracing:            management.tracing.enabled <- FINERACT_MANAGEMENT_TRACIING_ENABLED
  *                        (the typo "TRACIING" IS the real name in 1.16.1; the spec value is correct)
+ *  - NOTE (Task 6): 1.16.1 has NO micrometer-tracing/OTel bridge dependency, so the three tracing
+ *    settings below/above emit no spans. Spans come from the ADOT Java agent attached in app-stack.ts.
  *  - OTLP traces endpoint: NO FINERACT_* env var exists. Only management.otlp.metrics.export.url
  *                        (FINERACT_MANAGEMENT_OLTP_METRICS_EXPORT_URL) is mapped, and it is the metrics exporter.
  *                        We use Spring Boot relaxed binding: MANAGEMENT_OTLP_TRACING_ENDPOINT.
@@ -50,4 +52,12 @@ export function fineractEnvironment(dbHost: string): Record<string, string> {
     FINERACT_LOGGING_HTTP_CORRELATION_ID_HEADER_NAME: 'X-Correlation-ID',
     FINERACT_MANAGEMENT_METRICS_DISTRIBUTION_HTTP_SERVER_REQUESTS: 'true',
   };
+}
+
+import { Fn } from 'aws-cdk-lib';
+
+/** Replace every `placeholder` in `text` with a (possibly unresolved) CloudFormation token. */
+export function substituteToken(text: string, placeholder: string, token: string): string {
+  const parts = text.split(placeholder);
+  return Fn.join('', parts.flatMap((part, i) => (i === 0 ? [part] : [token, part])));
 }

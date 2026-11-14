@@ -1,0 +1,28 @@
+server:
+  http_listen_port: 3200
+  grpc_listen_port: 9095
+
+distributor:
+  receivers:
+    otlp:
+      protocols:
+        http:
+          endpoint: 0.0.0.0:4318
+
+compactor:
+  compaction:
+    block_retention: 72h
+
+storage:
+  trace:
+    backend: s3
+    s3:
+      bucket: __BUCKET__
+      prefix: tempo
+      endpoint: s3.us-east-1.amazonaws.com
+      region: us-east-1
+    wal:
+      path: /var/tempo/wal
+
+usage_report:
+  reporting_enabled: false
