@@ -48,6 +48,9 @@ const FINERACT_DNS_NAME = `${FINERACT_DNS_LABEL}.harness.local`;
 const SIDECAR_CONFIG_WRITER_IMAGE = 'busybox:1.37.0';
 const readConfig = (file: string): string => fs.readFileSync(path.join(__dirname, '..', 'config', file), 'utf8');
 
+// postgres:18 (psql client for the one-off db-init and db-reader-grant tasks), pinned by digest (multi-arch index).
+const POSTGRES_IMAGE = 'postgres:18@sha256:b9f6b8ff03b62f3cfd9d9ba3fe56226a9991c79d3fb46fd46536263bf02be553';
+
 export interface AppStackProps extends cdk.StackProps {
   data: DataStack;
   dns: DnsStack;
@@ -152,7 +155,7 @@ export class AppStack extends cdk.Stack {
       `echo db-init complete`,
     ].join('\n');
     this.dbInitTaskDef.addContainer('dbinit', {
-      image: ecs.ContainerImage.fromRegistry('postgres:18'),
+      image: ecs.ContainerImage.fromRegistry(POSTGRES_IMAGE),
       entryPoint: ['/bin/bash', '-c'],
       command: [dbInitScript],
       environment: { PGHOST: dbHost, PGPORT: '5432', PGDATABASE: 'postgres', PGSSLMODE: 'require' },
@@ -382,7 +385,7 @@ export class AppStack extends cdk.Stack {
       runtimePlatform: { cpuArchitecture: ecs.CpuArchitecture.X86_64, operatingSystemFamily: ecs.OperatingSystemFamily.LINUX },
     });
     this.dbReaderGrantTaskDef.addContainer('dbreadergrant', {
-      image: ecs.ContainerImage.fromRegistry('postgres:18'),
+      image: ecs.ContainerImage.fromRegistry(POSTGRES_IMAGE),
       entryPoint: ['/bin/bash', '-c'],
       command: [
         'set -e; printf "%s" "$READER_SQL" > /tmp/db_reader.sql; ' +

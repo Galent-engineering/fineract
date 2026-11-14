@@ -25,7 +25,9 @@ wait_db() { # wait_db <status>
   while [ "$(db_status)" != "$1" ]; do echo "  rds: $(db_status) (waiting for $1)"; sleep 30; done
 }
 
-# 1. Save current counts, unless everything is already 0 (re-run: keep the earlier snapshot).
+# 1. Save current counts. Never overwrite an existing snapshot while already paused (a re-run after a partial
+#    failure would otherwise record the half-scaled 0s), and never record an all-zero state.
+already=$(aws ssm get-parameter --name /harness/paused --query Parameter.Value --output text 2>/dev/null || echo false)
 counts='{}'; total=0
 for cs in $SERVICES; do
   c=${cs%%:*}; s=${cs##*:}
@@ -33,7 +35,9 @@ for cs in $SERVICES; do
   counts=$(python3 -c 'import json,sys; d=json.loads(sys.argv[1]); d[sys.argv[2]]=int(sys.argv[3]); print(json.dumps(d))' "$counts" "$cs" "$n")
   total=$((total + n))
 done
-if [ "$total" -gt 0 ]; then
+if [ "$already" = true ]; then
+  echo "already paused; keeping saved counts"
+elif [ "$total" -gt 0 ]; then
   aws ssm put-parameter --name /harness/desired-counts --type String --overwrite --value "$counts" >/dev/null
   echo "saved desired counts: $counts"
 else
@@ -50,7 +54,12 @@ for cs in $SERVICES; do
 done
 for cs in $SERVICES; do
   c=${cs%%:*}; s=${cs##*:}
-  aws ecs wait services-stable --cluster "$c" --services "$s"
+  waited=0
+  until aws ecs wait services-stable --cluster "$c" --services "$s"; do
+    waited=$((waited + 1))
+    [ "$waited" -lt 4 ] || { echo "FAILED: $s did not drain" >&2; exit 1; }
+    sleep 15
+  done
   echo "$s: 0 running"
 done
 

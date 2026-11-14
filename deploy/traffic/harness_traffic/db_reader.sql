@@ -3,6 +3,10 @@
 SELECT 'CREATE ROLE reliability_reader LOGIN'
 WHERE NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'reliability_reader') \gexec
 ALTER ROLE reliability_reader WITH LOGIN PASSWORD :'rpw';
+-- Guard rails against a connector bug: sessions are read-only by default, queries are capped, few connections.
+ALTER ROLE reliability_reader SET default_transaction_read_only = on;
+ALTER ROLE reliability_reader SET statement_timeout = '30s';
+ALTER ROLE reliability_reader CONNECTION LIMIT 5;
 
 GRANT CONNECT ON DATABASE fineract_tenants TO reliability_reader;
 GRANT CONNECT ON DATABASE fineract_default TO reliability_reader;

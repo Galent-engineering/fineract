@@ -14,6 +14,11 @@ from .client import FineractClient, FineractError, date_fields, fmt_date, rows
 PREFIX = "harness-"
 SEED_CLIENT_COUNT = 5
 READ_ONLY_ROLE = "Reliability Read Only"
+# Sensitive reads the connector does not need (business reads only): hooks, SMTP settings, user/role directories,
+# password policy. Sent as explicit False so a re-seed also revokes anything granted by hand.
+EXCLUDED_READ_CODES = frozenset(
+    {"READ_HOOK", "READ_EMAIL_CONFIGURATION", "READ_USER", "READ_ROLE", "READ_PASSWORD_PREFERENCES"}
+)
 LOAN_COB_CRON = "0 30 0 * * ?"  # UTC, 00:30 daily
 
 
@@ -172,8 +177,11 @@ async def ensure_read_only_role(client: FineractClient) -> tuple[int, int]:
             ]
         )
     perms = rows(await client.get("/permissions"))
-    read_codes = sorted({p["code"] for p in perms if str(p["code"]).startswith("READ_")})
-    await client.put(f"/roles/{role_id}/permissions", {"permissions": {c: True for c in read_codes}})
+    all_codes = sorted({str(p["code"]) for p in perms})
+    read_codes = [c for c in all_codes if c.startswith("READ_") and c not in EXCLUDED_READ_CODES]
+    granted = set(read_codes)
+    # PUT is additive: send an explicit False for everything else so a re-seed removes hand-added grants.
+    await client.put(f"/roles/{role_id}/permissions", {"permissions": {c: c in granted for c in all_codes}})
     return role_id, len(read_codes)
 
 

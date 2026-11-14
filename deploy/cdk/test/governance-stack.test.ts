@@ -29,29 +29,83 @@ const policyFor = (prop: 'Roles' | 'Users', frag: string): any =>
     JSON.stringify(p.Properties[prop] ?? []).includes(frag),
   )!;
 const actionsOf = (stmts: any[]) => stmts.flatMap((s) => (Array.isArray(s.Action) ? s.Action : [s.Action]));
-const allowed = [
-  /^(Get|List|Describe|BatchGet|Query|Search|Select)/,
-];
+// Literal on purpose (not imported from the lib): a change to the reader's permissions must change this test too.
+const EXPECTED_READER_ACTIONS = [
+  'aps:GetLabels', 'aps:GetMetricMetadata', 'aps:GetSeries', 'aps:QueryMetrics',
+  'cloudwatch:Describe*', 'cloudwatch:Get*', 'cloudwatch:List*',
+  'config:BatchGet*', 'config:Get*', 'config:List*', 'config:Select*',
+  'ecs:DescribeClusters', 'ecs:DescribeServices', 'ecs:DescribeTaskDefinition', 'ecs:DescribeTasks',
+  'ecs:ListClusters', 'ecs:ListServices', 'ecs:ListTaskDefinitionFamilies', 'ecs:ListTaskDefinitions', 'ecs:ListTasks',
+  'elasticloadbalancing:Describe*',
+  'fis:Get*', 'fis:List*',
+  'logs:DescribeLogGroups', 'logs:DescribeLogStreams', 'logs:FilterLogEvents', 'logs:GetQueryResults', 'logs:StartQuery',
+  'rds:DescribeDBInstances', 'rds:DescribeEvents',
+  'resiliencehub:Describe*', 'resiliencehub:List*',
+  'resource-explorer-2:Get*', 'resource-explorer-2:List*', 'resource-explorer-2:Search',
+  'xray:BatchGet*', 'xray:Get*',
+].sort();
+const SERVICE_ALLOWLIST = ['aps', 'xray', 'logs', 'cloudwatch', 'config', 'resource-explorer-2', 'resiliencehub', 'fis', 'ecs', 'rds', 'elasticloadbalancing'];
 
 describe('reader role', () => {
   const reader: any = roleOf('harness-reliability-reader');
   const readerPolicy = policyFor('Roles', 'ReaderRole');
-  const actions: string[] = actionsOf(readerPolicy.Properties.PolicyDocument.Statement);
+  const stmts: any[] = readerPolicy.Properties.PolicyDocument.Statement;
+  const actions: string[] = actionsOf(stmts);
+  const resourcesOf = (action: string) =>
+    stmts.filter((s) => ([] as string[]).concat(s.Action).includes(action)).flatMap((s) => ([] as any[]).concat(s.Resource));
 
-  test('holds only read/query/describe actions from the approved list', () => {
-    expect(actions.length).toBeGreaterThan(0);
+  test('holds exactly the approved action set (equality, not a verb heuristic)', () => {
+    expect([...actions].sort()).toEqual(EXPECTED_READER_ACTIONS);
+  });
+
+  test('every action is in the service allowlist; no secret-store, KMS, S3, SSM or IAM access', () => {
     for (const a of actions) {
-      const verb = a.split(':')[1];
-      expect(allowed.some((re) => re.test(verb)) || ['FilterLogEvents', 'StartQuery', 'GetQueryResults'].includes(verb)).toBe(true);
+      expect(SERVICE_ALLOWLIST).toContain(a.split(':')[0]);
+      expect(a).not.toMatch(/^(secretsmanager|ssm|kms|s3|iam|sts|ec2|lambda|dynamodb):/);
     }
   });
 
-  test('has no wildcard-all, Put, Create, Delete or Update', () => {
+  test('has no wildcard-all, Put, Create, Delete or Update, and only Allow statements without NotAction/NotResource', () => {
     for (const a of actions) {
       expect(a).not.toBe('*');
       expect(a).not.toMatch(/:\*$/);
       expect(a).not.toMatch(/:(Put|Create|Delete|Update)/);
     }
+    for (const s of stmts) {
+      expect(s.Effect).toBe('Allow');
+      expect(s.NotAction).toBeUndefined();
+      expect(s.NotResource).toBeUndefined();
+    }
+  });
+
+  test('log reads are scoped to /harness* log groups, never "*"', () => {
+    for (const a of ['logs:FilterLogEvents', 'logs:StartQuery', 'logs:DescribeLogStreams']) {
+      const res = resourcesOf(a);
+      expect(res.length).toBeGreaterThan(0);
+      for (const r of res) {
+        expect(JSON.stringify(r)).toContain('log-group:/harness*');
+      }
+    }
+  });
+
+  test('ECS reads are scoped to the harness clusters and harness-* task definition families', () => {
+    for (const a of ['ecs:DescribeClusters', 'ecs:ListServices', 'ecs:ListTasks', 'ecs:DescribeServices', 'ecs:DescribeTasks']) {
+      for (const r of resourcesOf(a)) expect(JSON.stringify(r)).toMatch(/(cluster|service|task)\/harness(-obs)?(\/|")/);
+    }
+    const td = resourcesOf('ecs:DescribeTaskDefinition');
+    expect(td).toHaveLength(1);
+    expect(JSON.stringify(td[0])).toContain('task-definition/harness-*:*');
+  });
+
+  test('AMP queries are scoped to the harness workspace, RDS describe to the harness instance', () => {
+    for (const a of ['aps:QueryMetrics', 'aps:GetSeries', 'aps:GetLabels', 'aps:GetMetricMetadata']) {
+      const res = resourcesOf(a);
+      expect(res).toHaveLength(1);
+      expect(JSON.stringify(res[0])).toContain('AmpWorkspace');
+    }
+    const rds = resourcesOf('rds:DescribeDBInstances');
+    expect(rds).toHaveLength(1);
+    expect(JSON.stringify(rds[0])).toContain('HarnessData');
   });
 
   test('trust policy is the connector user with an sts:ExternalId condition', () => {
@@ -98,6 +152,9 @@ describe('config, resilience, fis', () => {
     t.resourceCountIs('AWS::FIS::ExperimentTemplate', 2);
     const fisRole: any = roleOf('harness-fis');
     expect(JSON.stringify(fisRole.Properties.AssumeRolePolicyDocument)).toContain('fis.amazonaws.com');
+    const trust = JSON.stringify(fisRole.Properties.AssumeRolePolicyDocument);
+    expect(trust).toContain('aws:SourceAccount');
+    expect(trust).toContain('aws:SourceArn');
     const pol = policyFor('Roles', 'FisRole');
     for (const s of pol.Properties.PolicyDocument.Statement) {
       const acts = Array.isArray(s.Action) ? s.Action : [s.Action];

@@ -36,7 +36,7 @@ export class PauseStack extends cdk.Stack {
       code: lambda.Code.fromAsset(path.join(__dirname, '..', 'lambda'), {
         exclude: ['test_*', '__pycache__', '*.pyc', '.pytest_cache'],
       }),
-      timeout: cdk.Duration.seconds(30),
+      timeout: cdk.Duration.minutes(15), // the handler waits for the DB to become available before stopping it
       environment: { DB_INSTANCE_ID: db.instanceIdentifier, PAUSED_PARAM: paused.parameterName },
       logGroup: new logs.LogGroup(this, 'RestopLogs', { retention: logs.RetentionDays.ONE_MONTH, removalPolicy: cdk.RemovalPolicy.DESTROY }),
     });

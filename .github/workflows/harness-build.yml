@@ -4,6 +4,19 @@ on:
   workflow_dispatch:
   push:
     branches: [galent/reliability-harness]
+    # Docs-only pushes (README-harness.md, other *.md) build and deploy nothing.
+    paths:
+      - 'deploy/**'
+      - 'fineract-*/**'
+      - 'build.gradle'
+      - 'settings.gradle'
+      - 'gradle/**'
+      - '.github/workflows/harness-build.yml'
+
+# One run at a time per ref; a queued run waits instead of cancelling the one that is mid-deploy.
+concurrency:
+  group: harness-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   id-token: write
@@ -16,9 +29,6 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 60
-    outputs:
-      # Tag the deploy job pins: the sha when this run pushed a traffic image, else the currently pinned tag.
-      traffic_tag: ${{ steps.traffic_tag.outputs.tag }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -47,19 +57,13 @@ jobs:
           docker push "$REGISTRY/harness/fineract:${GITHUB_SHA}"
           docker push "$REGISTRY/harness/fineract:latest"
 
-      # deploy/traffic arrives in a later task; skip until it exists.
+      # One image per push (no provenance/SBOM attestations): the registry keeps one manifest per tag.
       - name: Build and push traffic image
-        if: hashFiles('deploy/traffic/Dockerfile') != ''
         env:
           REGISTRY: ${{ steps.ecr.outputs.registry }}
         run: |
-          docker build -t "$REGISTRY/harness/traffic:${GITHUB_SHA}" -t "$REGISTRY/harness/traffic:latest" deploy/traffic
-          docker push "$REGISTRY/harness/traffic:${GITHUB_SHA}"
-          docker push "$REGISTRY/harness/traffic:latest"
-
-      - id: traffic_tag
-        run: |
-          if [ -f deploy/traffic/Dockerfile ]; then echo "tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"; else echo "tag=t8-3" >> "$GITHUB_OUTPUT"; fi
+          docker buildx build --provenance=false --sbom=false --push \
+            -t "$REGISTRY/harness/traffic:${GITHUB_SHA}" -t "$REGISTRY/harness/traffic:latest" deploy/traffic
 
   deploy:
     needs: build
@@ -70,12 +74,9 @@ jobs:
     permissions:
       id-token: write
       contents: read
-    concurrency:
-      group: harness-deploy
-      cancel-in-progress: false
     env:
       FINERACT_TAG: ${{ github.sha }}
-      TRAFFIC_TAG: ${{ needs.build.outputs.traffic_tag }}
+      TRAFFIC_TAG: ${{ github.sha }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -83,13 +84,14 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: '22'
-      - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
-        with:
-          role-to-assume: ${{ vars.HARNESS_CI_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
+      # Dependencies are installed before any AWS credential exists, and without lifecycle scripts.
       - name: Install CDK app
         working-directory: deploy/cdk
-        run: npm ci
+        run: npm ci --ignore-scripts
+      - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        with:
+          role-to-assume: ${{ vars.HARNESS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
       - name: Deploy HarnessApp
         working-directory: deploy/cdk
         env:

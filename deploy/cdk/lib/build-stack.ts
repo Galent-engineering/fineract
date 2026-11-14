@@ -11,6 +11,7 @@ export class BuildStack extends cdk.Stack {
   public readonly fineractRepo: ecr.Repository;
   public readonly trafficRepo: ecr.Repository;
   public readonly ciRole: iam.Role;
+  public readonly deployRole: iam.Role;
 
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
     super(scope, id, props);
@@ -21,7 +22,12 @@ export class BuildStack extends cdk.Stack {
         imageScanOnPush: true,
         removalPolicy: cdk.RemovalPolicy.DESTROY,
         emptyOnDelete: true,
-        lifecycleRules: [{ maxImageCount: 10 }],
+        // Untagged manifests (old attestations, superseded pushes) go after 7 days; the newest 30 images
+        // stay so the deployed sha tag cannot expire while a task still needs to pull it.
+        lifecycleRules: [
+          { rulePriority: 1, tagStatus: ecr.TagStatus.UNTAGGED, maxImageAge: cdk.Duration.days(7) },
+          { rulePriority: 2, tagStatus: ecr.TagStatus.ANY, maxImageCount: 30 },
+        ],
       });
     this.fineractRepo = mkRepo('FineractRepo', 'harness/fineract');
     this.trafficRepo = mkRepo('TrafficRepo', 'harness/traffic');
@@ -33,9 +39,8 @@ export class BuildStack extends cdk.Stack {
       thumbprintList: ['6938fd4d98bab03faadb97b34396831e3780aea1'],
     });
 
-    this.ciRole = new iam.Role(this, 'CiRole', {
-      roleName: 'harness-github-ci',
-      assumedBy: new iam.FederatedPrincipal(
+    const githubTrust = () =>
+      new iam.FederatedPrincipal(
         provider.attrArn,
         {
           StringEquals: {
@@ -44,17 +49,28 @@ export class BuildStack extends cdk.Stack {
           },
         },
         'sts:AssumeRoleWithWebIdentity',
-      ),
+      );
+
+    // Build job (Gradle, Maven dependencies, docker): ECR push/pull only.
+    this.ciRole = new iam.Role(this, 'CiRole', {
+      roleName: 'harness-github-ci',
+      assumedBy: githubTrust(),
+      maxSessionDuration: cdk.Duration.hours(1),
+    });
+    // Deploy job (cdk + npm): separate role so build-time code never holds the CDK deploy permissions.
+    this.deployRole = new iam.Role(this, 'DeployRole', {
+      roleName: 'harness-github-deploy',
+      assumedBy: githubTrust(),
       maxSessionDuration: cdk.Duration.hours(1),
     });
 
     this.fineractRepo.grantPullPush(this.ciRole);
     this.trafficRepo.grantPullPush(this.ciRole);
 
-    // Deploy: the CI role only assumes the CDK bootstrap roles (the CFN execution role does the
+    // Deploy: the deploy role only assumes the CDK bootstrap roles (the CFN execution role does the
     // actual changes; it is broad by default, accepted for the dev account) and reads ECS service
     // state for `aws ecs wait services-stable`. No UpdateService: CDK rolls the task definition.
-    this.ciRole.addToPolicy(
+    this.deployRole.addToPolicy(
       new iam.PolicyStatement({
         actions: ['sts:AssumeRole'],
         resources: ['deploy', 'file-publishing', 'image-publishing', 'lookup'].map(
@@ -62,7 +78,7 @@ export class BuildStack extends cdk.Stack {
         ),
       }),
     );
-    this.ciRole.addToPolicy(
+    this.deployRole.addToPolicy(
       new iam.PolicyStatement({
         actions: ['ecs:DescribeServices'],
         resources: [`arn:${this.partition}:ecs:${this.region}:${this.account}:service/harness/*`],

@@ -64,6 +64,7 @@ export class DataStack extends cdk.Stack {
       securityGroups: [this.dbSg],
       multiAz: false,
       allocatedStorage: 20,
+      maxAllocatedStorage: 50, // ~190 MB/day of journeys: autoscale instead of a full disk in ~3 months
       storageType: rds.StorageType.GP3,
       storageEncrypted: true,
       backupRetention: cdk.Duration.days(1),

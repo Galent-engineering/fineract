@@ -11,13 +11,14 @@ Allowed paths: `deploy/**`, `.github/workflows/harness-*.yml`, `README-harness.m
 cd deploy/cdk
 npm ci
 npm test
-npx cdk synth -c allowedCidrs=$(curl -s https://checkip.amazonaws.com)/32 -c fineractImageTag=<sha> --profile galent-new-dev-1
+npx cdk synth -c allowedCidrs=$(curl -s https://checkip.amazonaws.com)/32 -c fineractImageTag=<sha> -c trafficImageTag=<sha> --profile galent-new-dev-1
 ```
 
 `allowedCidrs` (comma-separated) is required. `0.0.0.0/0` and `::/0` are rejected at synth.
-`fineractImageTag` is also required (no default; `latest` is rejected): pass the git sha of an image pushed to
-`harness/fineract`, e.g. `-c fineractImageTag=<sha>`. Synth fails with a clear error without it. Every
-`cdk deploy`/`cdk diff` must pass it, otherwise the task definition would silently move.
+`fineractImageTag` and `trafficImageTag` are also required (no default; `latest` is rejected): pass the git sha (or
+tag) of an image pushed to `harness/fineract` / `harness/traffic`, e.g. `-c fineractImageTag=<sha>`. Synth fails
+with a clear error without them. Every `cdk deploy`/`cdk diff` must pass both, otherwise the task definitions would
+silently move.
 
 Account: Galent dev (profile `galent-new-dev-1`), region `us-east-1`.
 
@@ -81,9 +82,14 @@ ECS desired counts are not managed by CloudFormation after creation (see Pause a
 sets Fineract's count explicitly, once:
 
 1. `cdk deploy --all ... -c fineractDesiredCount=0` (Fineract would otherwise start against empty databases and crash-loop).
+   The `traffic` service has no such context and is created with 1 task: **scale it to 0 straight away**
+   (`aws ecs update-service --cluster harness --service traffic --desired-count 0`), because there is no
+   `harness_admin` user until the seed has run (the traffic task retries its startup for 10 minutes, then exits).
 2. Run the one-off `harness-dbinit` task once (`aws ecs run-task`, family `harness-dbinit`) to create the databases and login.
 3. `cdk deploy HarnessApp ... -c fineractDesiredCount=1` (explicit, once). From then on omit `fineractDesiredCount`
    on every deploy; the property is then not sent and the live count is left alone.
+4. Run the one-off `harness-seed` task (creates reference data, `harness_admin`, the read-only API role and user,
+   rotates `mifos`), then the `harness-dbreadergrant` task (creates `reliability_reader`), then scale `traffic` to 1.
 
 ## Pause and resume
 
@@ -91,21 +97,25 @@ sets Fineract's count explicitly, once:
 us-east-1; both idempotent).
 
 - `pause.sh` stores the current desired counts of fineract, webapp, traffic and obs as JSON in SSM
-  `/harness/desired-counts` (a re-run while already at 0 keeps the earlier snapshot), sets `/harness/paused=true`,
+  `/harness/desired-counts` (never overwritten while `/harness/paused` is already `true`, and never with an all-zero
+  state, so a re-run after a partial failure keeps the good snapshot), sets `/harness/paused=true`,
   scales every service to 0, waits for the tasks to stop, then stops RDS and waits for `stopped`.
-- `resume.sh` starts RDS and waits for `available`, restores the saved counts (1 each if none saved), sets
-  `/harness/paused=false`, waits for all services to be steady, then calls
+- `resume.sh` starts RDS and waits for `available`, restores the saved counts (1 for a service missing from the snapshot or when there is no snapshot; any other SSM
+  error aborts), sets `/harness/paused=false`, waits for all services to be steady (at most 4 waits per service, with
+  the error shown, then it exits 1), clears the snapshot, then calls
   `GET /fineract-provider/api/v1/offices` through the ALB with the `harness/fineract/reliability-api` credentials
   (read inside the script, never printed) and expects 200. `/actuator/*` is a 404 at the ALB, so the health
-  endpoint is not used. Expect roughly 10-20 minutes each way, mostly RDS.
+  endpoint is not used. Measured: 7m26s to pause and 7m38s to resume, mostly RDS. Credentials are passed to curl on stdin, not in argv.
 - **Pause survives `cdk deploy`.** The services no longer set `desiredCount`, so CloudFormation never resets it.
   Only pass `-c fineractDesiredCount=<n>` deliberately (first deploy); doing so while paused would start Fineract
   against a stopped database.
 - **RDS auto-start guard.** AWS restarts a stopped instance after 7 days (RDS-EVENT-0154). An EventBridge rule
   invokes the `HarnessPause` Lambda (`deploy/cdk/lambda/restop_rds.py`, Python 3.12), which stops the instance
   again only when `/harness/paused` is `true` (least-privilege IAM: that parameter, plus Stop/Describe on the one
-  instance). While RDS is stopped, the ECS services are also at 0, so nothing else needs guarding.
-- Lambda tests: `cd deploy/cdk && uv run --with boto3 --with pytest pytest lambda -v`.
+  instance). The event arrives while the instance is still `starting`, so the Lambda (timeout 15 min) waits up to
+  13 min for `available`, re-reads the flag (resume may have run meanwhile), then stops it. While RDS is stopped, the ECS services are also at 0, so nothing else needs guarding.
+- Lambda tests: `cd deploy/cdk && uv run --with boto3 --with pytest pytest lambda -v`. Script tests (stub `aws`):
+  `cd deploy/scripts && uv run --with pytest pytest tests -v`.
 
 ## Estimated monthly cost
 
@@ -118,17 +128,22 @@ us-east-1 list prices (AWS Price List API, Nov 2026), 730 h/month, no savings pl
 | Fargate webapp + traffic (0.25 vCPU, 0.5 GB each) | $18 | 0 |
 | Public IPv4 on tasks (4) | $15 | 0 |
 | RDS db.t4g.small instance ($0.032/h) | $23 | 0 (stopped) |
-| RDS gp3 storage 20 GB + 1-day backups | $3 | $3 |
+| RDS gp3 storage 20 GB (autoscales to a 50 GB cap) + 1-day backups | $3 | $3 |
+| X-Ray (sampled, ~1.3M traces/month at ~$5 per million) | ~$6 | ~$6 (no traffic: ~$0) |
 | ALB ($0.0225/h + ~min LCU) + 2 public IPv4 | $29 | $29 |
 | Secrets Manager (10 secrets) | $4 | $4 |
-| AWS Config recorder | ~$4 | ~$4 |
+| AWS Config recorder (guess; billed per configuration item, account-wide in a shared account) | ~$4 | ~$4 |
 | Resilience Hub application | ~$15 | ~$15 |
 | AMP (ingest + storage) | ~$8 | ~$2 (storage only) |
 | CloudWatch Logs, S3 (Tempo/Loki), Cloud Map, Route 53, Lambda | ~$6 | ~$3 |
-| **Total** | **~$250** | **~$60** |
+| **Total** | **~$256** | **~$60** |
 
 Paused still pays for the ALB (and its IPv4 addresses), RDS storage, Secrets Manager, the Config recorder,
 Resilience Hub, and AMP/log storage. Teardown is the only way to reach zero.
+
+Storage: the journeys add about 190 MB/day (about 20 KB each, 8,640 per day), so the 20 GB disk would fill in about
+3 months; RDS storage autoscaling (`maxAllocatedStorage: 50`) grows it automatically up to 50 GB. Config, Resilience Hub
+and AMP figures are guesses.
 
 Check actuals after 7 days. The harness resources carry no cost-allocation tag and the dev account is shared with
 other workloads, so filter by service and read the harness-relevant lines (ECS, RDS, ELB, Secrets Manager, Config,
@@ -150,27 +165,60 @@ activated as a cost-allocation tag in Billing, add `Tags` filtering on `Harness*
    `PARENT_ZONE_ID=<parent zone id> PARENT_PROFILE=<prod profile> deploy/scripts/remove-parent-ns.sh` prints the exact
    DELETE batch (using the live NS values); add `--yes` to submit it. This is the only production write besides the one-time delegation.
 2. Then `npx cdk destroy --all` with the same three context values (`HarnessDns` only after step 1).
-3. Secrets with fixed names (`harness/db/*`, `harness/fineract/*`, `harness/obs/basic-auth`) are deleted with a
-   recovery window, so a redeploy right after a destroy can fail with "scheduled for deletion". Purge them first:
-   `aws secretsmanager delete-secret --secret-id <name> --force-delete-without-recovery`.
+3. Secrets with fixed names (`harness/db/*`, `harness/fineract/*`, `harness/obs/basic-auth`, `harness/reader/external-id`,
+   `harness/reader/access-key`) are deleted with a recovery window, so a redeploy right after a destroy can fail with
+   "scheduled for deletion". Purge them first:
+   `aws secretsmanager delete-secret --secret-id <name> --force-delete-without-recovery`. The SSM parameter
+   `/harness/desired-counts` is created by `pause.sh`, not by CDK, so it survives `cdk destroy`:
+   `aws ssm delete-parameter --name /harness/desired-counts`.
 4. RDS is created with a final snapshot on delete (`removalPolicy: SNAPSHOT`), and RDS keeps automated backups
    only for 1 day. After the destroy, delete the leftover final snapshot (`aws rds describe-db-snapshots
    --snapshot-type manual`, then `aws rds delete-db-snapshot --db-snapshot-identifier <id>`) unless you want it.
    Also check the CloudWatch log groups of the stacks if you want them gone.
 
+## Reader role scope (`HarnessGovernance`)
+
+The connector user `harness-reliability-connector` can only `sts:AssumeRole` into `harness-reliability-reader`
+(external id in `harness/reader/external-id`). The role is read-only (an exact action list is pinned in
+`governance-stack.test.ts`) and, because the dev account is shared, scoped to the harness where AWS allows it:
+
+- CloudWatch Logs: `FilterLogEvents`, `StartQuery`, `DescribeLogStreams` on log groups `/harness*` only.
+- ECS: Describe/List on clusters `harness` and `harness-obs`, their services and tasks, and `DescribeTaskDefinition`
+  only for families `harness-*` (other teams' task definitions carry plaintext environment variables).
+- AMP: query/get on the harness workspace only. RDS: `DescribeDBInstances` on the harness instance.
+- **Still account-wide** (no resource-level support): X-Ray, CloudWatch metrics, AWS Config (reads recorded
+  resources, including IAM roles), Resource Explorer search, Resilience Hub, FIS, ELB describe, and name-only
+  listings (`ecs:ListClusters`, `ecs:ListTaskDefinitions`, `logs:DescribeLogGroups`, `rds:DescribeEvents`).
+- The Resource Explorer index and default view are reused, not managed here; deleting them breaks `Search`.
+
 ## CI deploy
 
-`.github/workflows/harness-build.yml` has a `deploy` job that runs only on a push to `galent/reliability-harness`
-and only when the repo variable `HARNESS_DEPLOY` is `true` (set to `false` to disable). It needs the `build` job,
-then runs `cdk deploy HarnessApp --exclusively` with `fineractImageTag=<commit sha>` and `trafficImageTag=<commit sha>`
-(the build job pushes both), and waits for `aws ecs wait services-stable`. It uses the `harness-github-ci` role
-(trust pinned to this branch), which can only assume the CDK bootstrap roles and describe ECS services. The CFN
-execution role from bootstrap is broad by default; this is accepted for the dev account.
+`.github/workflows/harness-build.yml` runs on a push to `galent/reliability-harness` that touches `deploy/**`,
+`fineract-*/**`, `build.gradle`, `settings.gradle`, `gradle/**` or the workflow itself (a docs-only push, including
+this README, runs nothing), and on manual dispatch. Runs are serialised per ref (`concurrency` group
+`harness-<ref>`, no cancel), so a later push waits for the one mid-deploy.
+
+- **build** job: assumes `harness-github-ci` (variable `HARNESS_CI_ROLE_ARN`), which holds ECR push/pull on the two
+  repos and nothing else. It builds both images (the traffic image with `--provenance=false --sbom=false`, one
+  manifest per push).
+- **deploy** job: runs only on a push to the branch and only when the repo variable `HARNESS_DEPLOY` is `true`.
+  It installs the CDK app (`npm ci --ignore-scripts`, before any credential exists), assumes `harness-github-deploy`
+  (variable `HARNESS_DEPLOY_ROLE_ARN`), and runs `cdk deploy HarnessApp --exclusively` with
+  `fineractImageTag=<commit sha>` and `trafficImageTag=<commit sha>`, then waits for `aws ecs wait services-stable`.
+- Both roles trust the OIDC subject of this branch (immutable-id form); `harness-github-deploy` can only assume the
+  CDK bootstrap roles and describe ECS services. Because both roles share one trust subject, the split limits what
+  each role's *policy* grants, not who can ask for it: a step in the build job could still request the deploy role.
+  Moving the deploy job to a GitHub environment (subject `...:environment:harness-deploy`) would close that.
+  The CFN execution role from bootstrap is broad by default; this is accepted for the dev account.
+- ECR keeps the newest 30 images per repo and expires untagged manifests after 7 days.
 
 - `allowedCidrs` comes from the repository secret `HARNESS_ALLOWED_CIDRS` (a secret, not a variable: public repo logs).
-  Update it with `gh secret set HARNESS_ALLOWED_CIDRS -R Galent-engineering/fineract -b "<cidr>"`. A different value
-  than the live one changes the ALB security-group ingress on the next CI deploy.
-- Changes to `HarnessBuild` (including the CI role policy) are deployed locally, never by CI.
+  CI only deploys `HarnessApp`, which does not use it (only `HarnessData` consumes `allowedCidrs`), so the value only
+  has to be a valid CIDR to get through synth; a stale value matters only for a local `cdk deploy HarnessData`/`--all`.
+  Update it with `gh secret set HARNESS_ALLOWED_CIDRS -R Galent-engineering/fineract -b "<cidr>"`.
+- Changes to `HarnessBuild` (including the role policies) are deployed locally, never by CI. After deploying it, set
+  the variables: `gh variable set HARNESS_DEPLOY_ROLE_ARN -R Galent-engineering/fineract -b <role arn>` (always pass
+  `-R`; the clone's default remote is upstream Apache).
 - **Image tags after a CI deploy.** The deployed tag is whatever the last CI deploy used; read it with
   `aws ecs describe-task-definition` and pass it to local `cdk` commands, otherwise a local deploy rolls the image back:
 

@@ -35,7 +35,12 @@ describe('PauseStack', () => {
     expect(JSON.stringify(rds.Resource)).not.toBe('"*"');
     const ssm = stmts.find((s: any) => ([] as any[]).concat(s.Action).includes('ssm:GetParameter'));
     expect(ssm.Action).toBe('ssm:GetParameter');
-    expect(JSON.stringify(ssm.Resource)).toContain('PausedBC22E7EB');
+    const pausedLogicalId = Object.keys(t.findResources('AWS::SSM::Parameter'))[0];
+    expect(JSON.stringify(ssm.Resource)).toContain(pausedLogicalId);
+  });
+
+  test('lambda timeout is 900 s so the re-stop can wait out an RDS start', () => {
+    t.hasResourceProperties('AWS::Lambda::Function', { Handler: 'restop_rds.handler', Timeout: 900 });
   });
 
   test('paused parameter exists with initial value false', () => {

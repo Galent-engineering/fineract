@@ -73,6 +73,7 @@ describe('DataStack', () => {
         DeletionProtection: false,
         MultiAZ: false,
         AllocatedStorage: '20',
+        MaxAllocatedStorage: 50,
         StorageType: 'gp3',
         BackupRetentionPeriod: 1,
       }),

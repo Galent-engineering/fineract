@@ -120,10 +120,15 @@ describe('AppStack', () => {
   test('db-init task def exists and takes credentials only via Secrets', () => {
     const def = byFamilyPrefix(t, 'dbinit');
     const c = def.Properties.ContainerDefinitions[0];
-    expect(c.Image).toBe('postgres:18');
+    expect(c.Image).toMatch(/^postgres:18@sha256:[0-9a-f]{64}$/);
     const keys = (c.Environment ?? []).map((e: any) => e.Name);
     expect(keys.filter((k: string) => /PASSWORD|SECRET|PGPASS|FINERACT_DB_PASS/i.test(k))).toEqual([]);
     expect(c.Secrets.length).toBeGreaterThanOrEqual(2);
+  });
+
+  test('db-reader-grant task def pins the postgres image by digest too', () => {
+    const c = byFamilyPrefix(t, 'dbreadergrant').Properties.ContainerDefinitions[0];
+    expect(c.Image).toMatch(/^postgres:18@sha256:[0-9a-f]{64}$/);
   });
 
   test('webapp: pinned openmf/web-app image, 256/512, X86_64, env points at the HTTPS domain', () => {

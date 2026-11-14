@@ -13,20 +13,49 @@ export const CONNECTOR_USER_NAME = 'harness-reliability-connector';
 export const EXTERNAL_ID_SECRET = 'harness/reader/external-id';
 export const ACCESS_KEY_SECRET = 'harness/reader/access-key';
 
-/** The only actions the reader role may ever hold (read/query/describe; no writes). */
-export const READER_ACTIONS = [
-  'aps:Query*', 'aps:Get*', 'aps:List*',
-  'xray:Get*', 'xray:BatchGet*',
-  'logs:FilterLogEvents', 'logs:StartQuery', 'logs:GetQueryResults', 'logs:Describe*',
-  'cloudwatch:Get*', 'cloudwatch:List*', 'cloudwatch:Describe*',
-  'config:Get*', 'config:List*', 'config:Select*', 'config:BatchGet*',
-  'resource-explorer-2:Search', 'resource-explorer-2:Get*', 'resource-explorer-2:List*',
-  'resiliencehub:Describe*', 'resiliencehub:List*',
-  'fis:Get*', 'fis:List*',
-  'ecs:Describe*', 'ecs:List*',
-  'rds:Describe*',
-  'elasticloadbalancing:Describe*',
-];
+export interface ReaderStatement { actions: string[]; resources: string[] }
+
+/**
+ * The reader role's whole policy: read/query/describe only, scoped to the harness wherever AWS supports
+ * resource-level permissions. Still account-wide because the services have no resource-level support for
+ * these actions: xray, cloudwatch, config, resource-explorer-2, resiliencehub, fis, elasticloadbalancing,
+ * and the name-only listings (ecs List clusters/task definitions, logs DescribeLogGroups/GetQueryResults,
+ * rds DescribeEvents).
+ */
+export function readerStatements(p: { account: string; region: string; partition: string; ampWorkspaceArn: string; dbArn: string }): ReaderStatement[] {
+  const ecs = `arn:${p.partition}:ecs:${p.region}:${p.account}`;
+  const logGroup = `arn:${p.partition}:logs:${p.region}:${p.account}:log-group:/harness*`;
+  return [
+    // AMP: the harness workspace only.
+    { actions: ['aps:QueryMetrics', 'aps:GetSeries', 'aps:GetLabels', 'aps:GetMetricMetadata'], resources: [p.ampWorkspaceArn] },
+    // Logs: /harness* log groups only. (An unscoped DescribeLogGroups / GetQueryResults reveals names and ids, not events.)
+    { actions: ['logs:FilterLogEvents', 'logs:StartQuery', 'logs:DescribeLogStreams'], resources: [logGroup, `${logGroup}:*`] },
+    { actions: ['logs:DescribeLogGroups', 'logs:GetQueryResults'], resources: ['*'] },
+    // ECS: the two harness clusters and harness-* task definition families (other teams' task definitions
+    // carry plaintext environment variables, so DescribeTaskDefinition must not be account-wide).
+    { actions: ['ecs:DescribeClusters', 'ecs:ListServices', 'ecs:ListTasks'], resources: [`${ecs}:cluster/harness`, `${ecs}:cluster/harness-obs`] },
+    { actions: ['ecs:DescribeServices'], resources: [`${ecs}:service/harness/*`, `${ecs}:service/harness-obs/*`] },
+    { actions: ['ecs:DescribeTasks'], resources: [`${ecs}:task/harness/*`, `${ecs}:task/harness-obs/*`] },
+    { actions: ['ecs:DescribeTaskDefinition'], resources: [`${ecs}:task-definition/harness-*:*`] },
+    { actions: ['ecs:ListClusters', 'ecs:ListTaskDefinitions', 'ecs:ListTaskDefinitionFamilies'], resources: ['*'] },
+    // RDS: the harness instance (DescribeEvents has no resource-level support).
+    { actions: ['rds:DescribeDBInstances'], resources: [p.dbArn] },
+    { actions: ['rds:DescribeEvents'], resources: ['*'] },
+    // No resource-level support: account-wide, read-only.
+    {
+      actions: [
+        'xray:Get*', 'xray:BatchGet*',
+        'cloudwatch:Get*', 'cloudwatch:List*', 'cloudwatch:Describe*',
+        'config:Get*', 'config:List*', 'config:Select*', 'config:BatchGet*',
+        'resource-explorer-2:Search', 'resource-explorer-2:Get*', 'resource-explorer-2:List*',
+        'resiliencehub:Describe*', 'resiliencehub:List*',
+        'fis:Get*', 'fis:List*',
+        'elasticloadbalancing:Describe*',
+      ],
+      resources: ['*'],
+    },
+  ];
+}
 
 /** Config records only the harness's resource types (no global recording). */
 export const RECORDED_TYPES = [
@@ -76,7 +105,12 @@ export class GovernanceStack extends cdk.Stack {
       }),
       maxSessionDuration: cdk.Duration.hours(1),
     });
-    this.readerRole.addToPolicy(new iam.PolicyStatement({ actions: READER_ACTIONS, resources: ['*'] }));
+    for (const st of readerStatements({
+      account: this.account, region: this.region, partition: this.partition,
+      ampWorkspaceArn: app.ampWorkspace.attrArn, dbArn: data.db.instanceArn,
+    })) {
+      this.readerRole.addToPolicy(new iam.PolicyStatement(st));
+    }
 
     user.addToPolicy(new iam.PolicyStatement({ actions: ['sts:AssumeRole'], resources: [this.readerRole.roleArn] }));
 
@@ -223,7 +257,10 @@ export class GovernanceStack extends cdk.Stack {
     // ---- Fault Injection Service: templates only; no experiment is ever started here --------------
     const fisRole = new iam.Role(this, 'FisRole', {
       roleName: 'harness-fis',
-      assumedBy: new iam.ServicePrincipal('fis.amazonaws.com'),
+      assumedBy: new iam.PrincipalWithConditions(new iam.ServicePrincipal('fis.amazonaws.com'), {
+        StringEquals: { 'aws:SourceAccount': this.account },
+        ArnLike: { 'aws:SourceArn': `arn:${this.partition}:fis:${this.region}:${this.account}:experiment/*` },
+      }),
     });
     const taskArns = `arn:${this.partition}:ecs:${this.region}:${this.account}:task/harness/*`;
     fisRole.addToPolicy(new iam.PolicyStatement({

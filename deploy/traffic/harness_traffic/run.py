@@ -12,7 +12,7 @@ from typing import Awaitable, Callable
 
 import boto3
 
-from .client import FineractClient, FineractError
+from .client import FineractClient, FineractError  # noqa: F401  (re-exported for tests)
 from .journeys import (
     JourneyOutcome,
     inject_error,
@@ -27,6 +27,14 @@ from .seed import SeedResult, seed
 MAX_CONSECUTIVE_FAILURES = 5
 SAVINGS_PER_LOAN = 0.25
 LATER_REPAYMENT_RATE = 0.3
+
+
+async def _guard(journey: str, make: Callable[[], Awaitable[JourneyOutcome]]) -> JourneyOutcome:
+    """An unexpected exception (missing response field, ...) is a failed journey, not a crash with a traceback."""
+    try:
+        return await make()
+    except Exception as exc:  # noqa: BLE001
+        return JourneyOutcome(journey, error=f"{type(exc).__name__}: {exc}")
 
 
 async def run(
@@ -50,17 +58,18 @@ async def run(
         started = time.monotonic()
         outcomes: list[JourneyOutcome] = []
         if rng.random() < error_rate:
-            outcomes.append(await inject_error(client))  # expected 4xx: logged, not counted as a failure
+            outcomes.append(await _guard("inject_error", lambda: inject_error(client)))  # expected 4xx: logged, not counted
         if rng.random() < slow_rate:
-            outcomes.append(await inject_slow(client))
-        loan = await run_loan_journey(client, seed_result)
+            outcomes.append(await _guard("inject_slow", lambda: inject_slow(client)))
+        loan = await _guard("loan", lambda: run_loan_journey(client, seed_result))
         outcomes.append(loan)
         if "loan" in loan.ids and "disburse" in loan.steps:
             loans.append(loan.ids["loan"])
         if rng.random() < SAVINGS_PER_LOAN:
-            outcomes.append(await run_savings_journey(client, seed_result))
+            outcomes.append(await _guard("savings", lambda: run_savings_journey(client, seed_result)))
         if loans and rng.random() < LATER_REPAYMENT_RATE:
-            outcomes.append(await run_repayment(client, rng.choice(list(loans))))
+            loan_id = rng.choice(list(loans))
+            outcomes.append(await _guard("repayment", lambda: run_repayment(client, loan_id)))
 
         for o in outcomes:
             log("journey", journey=o.journey, status=o.status or 200, steps=len(o.steps), error=o.error, injected=o.injected)
@@ -79,15 +88,41 @@ def _credentials(secret_arn: str) -> tuple[str, str]:
     return s["username"], s["password"]
 
 
+STARTUP_MAX_WAIT_S = 600
+STARTUP_FIRST_DELAY_S = 5.0
+STARTUP_MAX_DELAY_S = 60.0
+
+
+async def startup_seed(
+    client: FineractClient,
+    *,
+    seed_fn: Callable[[FineractClient], Awaitable[SeedResult]] = seed,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    max_wait_s: float = STARTUP_MAX_WAIT_S,
+) -> SeedResult:
+    """The startup lookups can fail while Fineract boots (about 7 min after a resume): retry with backoff for up to
+    ten minutes instead of crash-looping under ECS restart throttling. Any exception is retried, including
+    unexpected ones (KeyError on a response field, StopIteration inside seed)."""
+    waited, delay = 0.0, STARTUP_FIRST_DELAY_S
+    while True:
+        try:
+            return await seed_fn(client)
+        except Exception as exc:  # noqa: BLE001
+            status = getattr(exc, "status", None)
+            log("startup_retry", error=f"{type(exc).__name__}", status=status, waited_s=waited)
+            if waited >= max_wait_s:
+                log("fatal", reason=f"startup lookup failed for {int(waited)}s: {type(exc).__name__} {status}")
+                raise SystemExit(1) from exc
+            await sleep(delay)
+            waited += delay
+            delay = min(delay * 2, STARTUP_MAX_DELAY_S)
+
+
 async def main_async() -> None:
     base = os.environ["FINERACT_BASE_URL"]
     username, password = _credentials(os.environ["SECRET_ARN"])
     client = FineractClient(base, username, password)
-    try:
-        seed_result = await seed(client)
-    except FineractError as exc:
-        log("fatal", reason=f"startup lookup failed: HTTP {exc.status}")
-        raise SystemExit(1) from exc
+    seed_result = await startup_seed(client)
     log("start", rate_per_min=os.environ.get("RATE_PER_MIN", "6"))
     await run(
         client,
