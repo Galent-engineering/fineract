@@ -16,6 +16,9 @@ jobs:
   build:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    outputs:
+      # Tag the deploy job pins: the sha when this run pushed a traffic image, else the currently pinned tag.
+      traffic_tag: ${{ steps.traffic_tag.outputs.tag }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
@@ -54,17 +57,51 @@ jobs:
           docker push "$REGISTRY/harness/traffic:${GITHUB_SHA}"
           docker push "$REGISTRY/harness/traffic:latest"
 
+      - id: traffic_tag
+        run: |
+          if [ -f deploy/traffic/Dockerfile ]; then echo "tag=${GITHUB_SHA}" >> "$GITHUB_OUTPUT"; else echo "tag=t8-3" >> "$GITHUB_OUTPUT"; fi
+
   deploy:
     needs: build
-    if: vars.HARNESS_DEPLOY == 'true'
+    # Never on pull_request or workflow_dispatch; only a push to the harness branch, and only when enabled.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/galent/reliability-harness' && vars.HARNESS_DEPLOY == 'true'
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      id-token: write
+      contents: read
+    concurrency:
+      group: harness-deploy
+      cancel-in-progress: false
+    env:
+      FINERACT_TAG: ${{ github.sha }}
+      TRAFFIC_TAG: ${{ needs.build.outputs.traffic_tag }}
     steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: '22'
       - uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
         with:
           role-to-assume: ${{ vars.HARNESS_CI_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
-      - name: Roll services
+      - name: Install CDK app
+        working-directory: deploy/cdk
+        run: npm ci
+      - name: Deploy HarnessApp
+        working-directory: deploy/cdk
+        env:
+          ALLOWED: ${{ secrets.HARNESS_ALLOWED_CIDRS }}
         run: |
-          for svc in fineract traffic; do
-            aws ecs update-service --cluster harness --service "$svc" --force-new-deployment >/dev/null
-          done
+          # Secrets are masked by Actions already; mask the value and each entry explicitly too.
+          echo "::add-mask::$ALLOWED"
+          for c in ${ALLOWED//,/ }; do echo "::add-mask::$c"; done
+          npx cdk deploy HarnessApp --exclusively --require-approval never \
+            -c "allowedCidrs=$ALLOWED" \
+            -c "fineractImageTag=$FINERACT_TAG" \
+            -c "trafficImageTag=$TRAFFIC_TAG"
+      - name: Wait for services to stabilise
+        run: |
+          aws ecs wait services-stable --cluster harness --services fineract traffic

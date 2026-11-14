@@ -38,4 +38,19 @@ describe('BuildStack', () => {
       });
     }
   });
+
+  test('CI role may only assume the CDK bootstrap roles and read ECS services (no wildcards)', () => {
+    const policies = synth().findResources('AWS::IAM::Policy');
+    const stmts = Object.values(policies).flatMap((p: any) => p.Properties.PolicyDocument.Statement);
+    const assume = stmts.find((s: any) => ([] as string[]).concat(s.Action).includes('sts:AssumeRole'));
+    expect(assume.Resource).toHaveLength(4);
+    for (const r of assume.Resource) expect(JSON.stringify(r)).toMatch(/cdk-hnb659fds-(deploy|file-publishing|image-publishing|lookup)-role-/);
+    for (const s of stmts) {
+      for (const a of ([] as string[]).concat(s.Action)) {
+        expect(a).not.toBe('*');
+        expect(a).not.toMatch(/^iam:/);
+        expect(a).not.toBe('ecs:UpdateService');
+      }
+    }
+  });
 });

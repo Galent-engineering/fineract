@@ -157,3 +157,26 @@ activated as a cost-allocation tag in Billing, add `Tags` filtering on `Harness*
    only for 1 day. After the destroy, delete the leftover final snapshot (`aws rds describe-db-snapshots
    --snapshot-type manual`, then `aws rds delete-db-snapshot --db-snapshot-identifier <id>`) unless you want it.
    Also check the CloudWatch log groups of the stacks if you want them gone.
+
+## CI deploy
+
+`.github/workflows/harness-build.yml` has a `deploy` job that runs only on a push to `galent/reliability-harness`
+and only when the repo variable `HARNESS_DEPLOY` is `true` (set to `false` to disable). It needs the `build` job,
+then runs `cdk deploy HarnessApp --exclusively` with `fineractImageTag=<commit sha>` and `trafficImageTag=<commit sha>`
+(the build job pushes both), and waits for `aws ecs wait services-stable`. It uses the `harness-github-ci` role
+(trust pinned to this branch), which can only assume the CDK bootstrap roles and describe ECS services. The CFN
+execution role from bootstrap is broad by default; this is accepted for the dev account.
+
+- `allowedCidrs` comes from the repository secret `HARNESS_ALLOWED_CIDRS` (a secret, not a variable: public repo logs).
+  Update it with `gh secret set HARNESS_ALLOWED_CIDRS -R Galent-engineering/fineract -b "<cidr>"`. A different value
+  than the live one changes the ALB security-group ingress on the next CI deploy.
+- Changes to `HarnessBuild` (including the CI role policy) are deployed locally, never by CI.
+- **Image tags after a CI deploy.** The deployed tag is whatever the last CI deploy used; read it with
+  `aws ecs describe-task-definition` and pass it to local `cdk` commands, otherwise a local deploy rolls the image back:
+
+  ```
+  aws ecs describe-task-definition --profile galent-new-dev-1 --region us-east-1 \
+    --task-definition "$(aws ecs describe-services --cluster harness --services fineract --profile galent-new-dev-1 --region us-east-1 --query 'services[0].taskDefinition' --output text)" \
+    --query 'taskDefinition.containerDefinitions[?name==`fineract`].image' --output text
+  # same for the traffic service: --services traffic and containerDefinitions[?name==`traffic`]
+  ```

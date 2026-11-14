@@ -51,9 +51,20 @@ export class BuildStack extends cdk.Stack {
     this.fineractRepo.grantPullPush(this.ciRole);
     this.trafficRepo.grantPullPush(this.ciRole);
 
+    // Deploy: the CI role only assumes the CDK bootstrap roles (the CFN execution role does the
+    // actual changes; it is broad by default, accepted for the dev account) and reads ECS service
+    // state for `aws ecs wait services-stable`. No UpdateService: CDK rolls the task definition.
     this.ciRole.addToPolicy(
       new iam.PolicyStatement({
-        actions: ['ecs:UpdateService', 'ecs:DescribeServices'],
+        actions: ['sts:AssumeRole'],
+        resources: ['deploy', 'file-publishing', 'image-publishing', 'lookup'].map(
+          (r) => `arn:${this.partition}:iam::${this.account}:role/cdk-hnb659fds-${r}-role-${this.account}-${this.region}`,
+        ),
+      }),
+    );
+    this.ciRole.addToPolicy(
+      new iam.PolicyStatement({
+        actions: ['ecs:DescribeServices'],
         resources: [`arn:${this.partition}:ecs:${this.region}:${this.account}:service/harness/*`],
       }),
     );
