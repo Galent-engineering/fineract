@@ -1,3 +1,5 @@
+import { Fn } from 'aws-cdk-lib';
+
 /**
  * Non-secret Fineract environment. Property/env names were confirmed against
  * fineract-provider/src/main/resources/application.properties at tag 1.16.1:
@@ -44,6 +46,9 @@ export function fineractEnvironment(dbHost: string): Record<string, string> {
     FINERACT_DEFAULT_TENANTDB_TIMEZONE: 'UTC',
     FINERACT_MANAGEMENT_ENDPOINT_WEB_EXPOSURE_INCLUDE: 'health,info,prometheus',
     FINERACT_MANAGEMENT_PROMETHEUS_ENABLED: 'true',
+    // INERT in 1.16.1 (no tracing bridge on the classpath): the next three settings emit no spans and the
+    // sampling value does NOT control anything. Spans come from the ADOT Java agent (see app-stack.ts);
+    // tune sampling there (OTEL_TRACES_SAMPLER*), not here.
     FINERACT_MANAGEMENT_TRACIING_ENABLED: 'true',
     MANAGEMENT_OTLP_TRACING_ENDPOINT: 'http://localhost:4318/v1/traces',
     MANAGEMENT_TRACING_SAMPLING_PROBABILITY: '1.0',
@@ -53,8 +58,6 @@ export function fineractEnvironment(dbHost: string): Record<string, string> {
     FINERACT_MANAGEMENT_METRICS_DISTRIBUTION_HTTP_SERVER_REQUESTS: 'true',
   };
 }
-
-import { Fn } from 'aws-cdk-lib';
 
 /** Replace every `placeholder` in `text` with a (possibly unresolved) CloudFormation token. */
 export function substituteToken(text: string, placeholder: string, token: string): string {

@@ -34,12 +34,19 @@ export function loadHarnessConfig(app: cdk.App): HarnessConfig {
     }
   }
 
+  const fineractImageTag = String(app.node.tryGetContext('fineractImageTag') ?? '').trim();
+  if (fineractImageTag === '' || fineractImageTag === 'latest') {
+    throw new HarnessConfigError(
+      'fineractImageTag is required and must be an immutable tag, not "latest" (-c fineractImageTag=<git sha pushed to harness/fineract>)',
+    );
+  }
+
   return {
     allowedCidrs,
     account: process.env.CDK_DEFAULT_ACCOUNT ?? String(app.node.tryGetContext('account') ?? ''),
     region: 'us-east-1',
     githubRepo: 'Galent-engineering/fineract',
     githubBranch: 'galent/reliability-harness',
-    fineractImageTag: String(app.node.tryGetContext('fineractImageTag') ?? 'latest'),
+    fineractImageTag: fineractImageTag,
   };
 }

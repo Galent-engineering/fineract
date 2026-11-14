@@ -10,7 +10,7 @@ import { AppStack } from '../lib/app-stack';
 import { ObsStack } from '../lib/obs-stack';
 
 const synth = () => {
-  const app = new cdk.App({ context: { allowedCidrs: '203.0.113.7/32' } });
+  const app = new cdk.App({ context: { allowedCidrs: '203.0.113.7/32', fineractImageTag: 'abc123' } });
   const config = loadHarnessConfig(app);
   const env = { account: '111111111111', region: 'us-east-1' };
   const build = new BuildStack(app, 'HarnessBuild', { env });
@@ -79,15 +79,64 @@ describe('Fineract telemetry sidecars', () => {
 describe('ObsStack', () => {
   const { obs } = synth();
 
-  test('nginx config requires auth_basic on both locations and strips the prefix', () => {
+  test('nginx: basic auth server-wide except /healthz, prefix stripped', () => {
     const conf = cfg('nginx.conf');
-    for (const loc of ['/tempo/', '/loki/']) {
-      const block = conf.split(`location ${loc} {`)[1]?.split('}')[0] ?? '';
-      expect(block).toMatch(/auth_basic\s+"/);
-      expect(block).toMatch(/auth_basic_user_file/);
+    expect(conf).toMatch(/server \{[^]*?auth_basic\s+"[^"]+";\s*auth_basic_user_file/);
+    const health = conf.split('location = /healthz {')[1]?.split('}')[0] ?? '';
+    expect(health).toMatch(/auth_basic off;/);
+    expect(conf).toMatch(/rewrite \^\/tempo\/\(\.\*\)\$ \/\$1 break;/);
+    expect(conf).toMatch(/proxy_pass http:\/\/127\.0\.0\.1:3200;/);
+    expect(conf).toMatch(/rewrite \^\/loki\/\(\.\*\)\$ \/\$1 break;/);
+    expect(conf).toMatch(/proxy_pass http:\/\/127\.0\.0\.1:3100;/);
+  });
+
+  test('nginx I-3: read-only allowlist, everything else 403', () => {
+    const conf = cfg('nginx.conf');
+    // no wholesale prefix proxy
+    expect(conf).not.toMatch(/location \/(tempo|loki)\/ \{/);
+    const locs: { head: string; body: string }[] = [];
+    const lines = conf.split('\n');
+    for (let i = 0; i < lines.length; i++) {
+      const m = lines[i].match(/^\s*location (.+) \{\s*$/);
+      if (!m) continue;
+      let depth = 1;
+      let body = '';
+      for (i++; i < lines.length && depth > 0; i++) {
+        depth += (lines[i].match(/\{\s*$/) ? 1 : 0) - (lines[i].match(/^\s*\}/) ? 1 : 0);
+        if (depth > 0) body += lines[i] + '\n';
+      }
+      i--;
+      locs.push({ head: m[1].trim(), body });
     }
-    expect(conf).toMatch(/proxy_pass http:\/\/127\.0\.0\.1:3200\/;/);
-    expect(conf).toMatch(/proxy_pass http:\/\/127\.0\.0\.1:3100\/;/);
+    const proxied = locs.filter((l) => /proxy_pass/.test(l.body));
+    expect(proxied.length).toBeGreaterThanOrEqual(3);
+    for (const l of proxied) {
+      expect(l.body).toMatch(/limit_except (GET HEAD|GET HEAD POST) \{\s*deny all;/);
+      expect(l.head).toMatch(/^~ \^\/(tempo|loki)\//);
+    }
+    // POST only on loki query, query_range, series
+    const post = proxied.filter((l) => /GET HEAD POST/.test(l.body));
+    expect(post).toHaveLength(1);
+    expect(post[0].head).toMatch(/\(query\|query_range\|series\)\$/);
+    // none of the write/admin endpoints is in an allowed pattern
+    const allowed = proxied.map((l) => l.head).join('\n');
+    for (const bad of ['push', 'delete', 'flush', 'shutdown', 'config', 'ring', 'admin', 'metrics']) {
+      expect(allowed).not.toMatch(new RegExp(bad));
+    }
+    const fallback = locs.find((l) => l.head === '/')!;
+    expect(fallback.body).toMatch(/return 403;/);
+  });
+
+  test('Loki flushes chunks quickly (I-7): idle 1m, max age 5m', () => {
+    const loki = cfg('loki.yaml');
+    expect(loki).toMatch(/chunk_idle_period: 1m/);
+    expect(loki).toMatch(/max_chunk_age: 5m/);
+  });
+
+  test('obs service has a circuit breaker with rollback (I-5)', () => {
+    const svcs = Object.values(obs.findResources('AWS::ECS::Service'));
+    expect(svcs).toHaveLength(1);
+    expect((svcs[0] as any).Properties.DeploymentConfiguration.DeploymentCircuitBreaker).toEqual({ Enable: true, Rollback: true });
   });
 
   test('basic-auth secret harness/obs/basic-auth with user reliability', () => {

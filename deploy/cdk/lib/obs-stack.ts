@@ -159,6 +159,7 @@ export class ObsStack extends cdk.Stack {
       securityGroups: [data.tasksSg],
       minHealthyPercent: 0,
       maxHealthyPercent: 100,
+      circuitBreaker: { rollback: true },
     });
 
     // ECS allows one service registry per service: tempo.harness.local is the real A record for the

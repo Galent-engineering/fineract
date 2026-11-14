@@ -6,7 +6,7 @@ import { DataStack } from '../lib/data-stack';
 const CIDRS = ['203.0.113.7/32', '198.51.100.9/32'];
 
 const synth = (allowedCidrs: string = CIDRS.join(',')) => {
-  const app = new cdk.App({ context: { allowedCidrs } });
+  const app = new cdk.App({ context: { allowedCidrs, fineractImageTag: 'abc123' } });
   const config = loadHarnessConfig(app);
   const stack = new DataStack(app, 'HarnessData', {
     env: { account: '111111111111', region: 'us-east-1' },

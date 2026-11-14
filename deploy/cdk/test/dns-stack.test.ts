@@ -8,7 +8,7 @@ import { AppStack } from '../lib/app-stack';
 
 const env = { account: '111111111111', region: 'us-east-1' };
 const build = () => {
-  const app = new cdk.App({ context: { allowedCidrs: '203.0.113.7/32,198.51.100.0/24' } });
+  const app = new cdk.App({ context: { allowedCidrs: '203.0.113.7/32,198.51.100.0/24', fineractImageTag: 'abc123' } });
   const config = loadHarnessConfig(app);
   const buildStack = new BuildStack(app, 'HarnessBuild', { env });
   const data = new DataStack(app, 'HarnessData', { env, allowedCidrs: config.allowedCidrs });

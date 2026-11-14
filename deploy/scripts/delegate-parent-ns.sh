@@ -2,11 +2,15 @@
 # Delegate fineract.galent.ai from the PRODUCTION parent zone (galent.ai) to the harness child zone.
 # The ONLY write: UPSERT of one NS record set named fineract.galent.ai. (TTL 300) in the parent zone.
 # Refuses to run if a non-NS record named fineract.galent.ai. already exists there.
+# Required environment (no production identifiers are committed to this repo):
+#   PARENT_ZONE_ID  hosted zone id of the parent galent.ai zone
+#   PARENT_PROFILE  AWS CLI profile with access to that zone
 set -euo pipefail
 
-DEV_PROFILE=galent-new-dev-1
-PROD_PROFILE=galent-prod-1
-PARENT_ZONE_ID=Z04718002CM1CVT3RKJ08
+: "${PARENT_ZONE_ID:?set PARENT_ZONE_ID to the parent galent.ai hosted zone id}"
+: "${PARENT_PROFILE:?set PARENT_PROFILE to the AWS profile for the parent zone}"
+DEV_PROFILE=${DEV_PROFILE:-galent-new-dev-1}
+PROD_PROFILE=$PARENT_PROFILE
 NAME=fineract.galent.ai.
 
 CHILD_ZONE_ID=$(aws route53 list-hosted-zones-by-name --dns-name "$NAME" --max-items 1 --profile "$DEV_PROFILE" \

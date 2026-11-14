@@ -7,7 +7,7 @@ import { DnsStack } from '../lib/dns-stack';
 import { AppStack } from '../lib/app-stack';
 
 const synth = () => {
-  const app = new cdk.App({ context: { allowedCidrs: '203.0.113.7/32' } });
+  const app = new cdk.App({ context: { allowedCidrs: '203.0.113.7/32', fineractImageTag: 'abc123' } });
   const config = loadHarnessConfig(app);
   const env = { account: '111111111111', region: 'us-east-1' };
   const build = new BuildStack(app, 'HarnessBuild', { env });
@@ -32,6 +32,42 @@ const byFamilyPrefix = (t: Template, prefix: string) => {
 
 describe('AppStack', () => {
   const t = synth();
+
+  test('HTTPS listener uses the TLS 1.2+/1.3 policy (I-1)', () => {
+    t.hasResourceProperties('AWS::ElasticLoadBalancingV2::Listener', {
+      Port: 443,
+      SslPolicy: 'ELBSecurityPolicy-TLS13-1-2-2021-06',
+    });
+  });
+
+  test('circuit breaker with rollback on the Fineract and webapp services (I-5)', () => {
+    const svcs = Object.values(t.findResources('AWS::ECS::Service'));
+    expect(svcs).toHaveLength(2);
+    for (const s of svcs) {
+      expect(s.Properties.DeploymentConfiguration.DeploymentCircuitBreaker).toEqual({ Enable: true, Rollback: true });
+    }
+  });
+
+  test.each(['HTTPS', 'HTTP'])('%s listener blocks actuator paths with a fixed 404 above the default (I-6)', (kind) => {
+    const port = kind === 'HTTPS' ? 443 : 80;
+    const listeners = t.findResources('AWS::ElasticLoadBalancingV2::Listener');
+    const lid = Object.keys(listeners).find((k) => listeners[k].Properties.Port === port)!;
+    const rules = Object.values(t.findResources('AWS::ElasticLoadBalancingV2::ListenerRule')).filter(
+      (r: any) => JSON.stringify(r.Properties.ListenerArn).includes(lid) && r.Properties.Actions[0].Type === 'fixed-response',
+    );
+    expect(rules).toHaveLength(1);
+    const r: any = rules[0];
+    expect(r.Properties.Actions[0].FixedResponseConfig.StatusCode).toBe('404');
+    expect(r.Properties.Priority).toBeLessThan(10);
+    const values = r.Properties.Conditions.flatMap((c: any) => c.PathPatternConfig?.Values ?? []);
+    expect(values).toEqual(expect.arrayContaining(['/actuator/*', '/fineract-provider/actuator/*']));
+  });
+
+  test('target group health check still targets readiness directly on the targets (I-6)', () => {
+    t.hasResourceProperties('AWS::ElasticLoadBalancingV2::TargetGroup', {
+      HealthCheckPath: '/fineract-provider/actuator/health/readiness',
+    });
+  });
 
   test('fineract container env has no PASSWORD/SECRET keys; credentials via Secrets', () => {
     const def = byFamilyPrefix(t, 'fineract');

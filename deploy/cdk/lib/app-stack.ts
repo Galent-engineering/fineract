@@ -245,6 +245,7 @@ export class AppStack extends cdk.Stack {
       healthCheckGracePeriod: cdk.Duration.seconds(900),
       minHealthyPercent: 0,
       maxHealthyPercent: 100,
+      circuitBreaker: { rollback: true },
     });
 
     // tasksSg ingress only from albSg on the container port (CfnSecurityGroupIngress avoids a Data<->App cycle).
@@ -307,6 +308,7 @@ export class AppStack extends cdk.Stack {
       securityGroups: [data.tasksSg],
       minHealthyPercent: 0,
       maxHealthyPercent: 100,
+      circuitBreaker: { rollback: true },
     });
     // The target group's connections add the ALB -> tasks :80 ingress rule automatically.
     const webTg = new elbv2.ApplicationTargetGroup(this, 'WebappTg', {
@@ -323,6 +325,7 @@ export class AppStack extends cdk.Stack {
       port: 443,
       protocol: elbv2.ApplicationProtocol.HTTPS,
       certificates: [props.dns.certificate],
+      sslPolicy: elbv2.SslPolicy.RECOMMENDED_TLS,
       open: false,
       defaultAction: elbv2.ListenerAction.forward([webTg]),
     });
@@ -342,6 +345,15 @@ export class AppStack extends cdk.Stack {
       },
       deregistrationDelay: cdk.Duration.seconds(30),
     });
+    // Actuator is never served through the ALB (metrics reach AMP via the ADOT sidecar scraping localhost;
+    // target-group health checks hit the targets directly, so they are unaffected).
+    const actuatorBlock = {
+      priority: 5,
+      conditions: [elbv2.ListenerCondition.pathPatterns(['/actuator/*', `${FINERACT_CONTEXT}/actuator/*`])],
+      action: elbv2.ListenerAction.fixedResponse(404, { contentType: 'text/plain', messageBody: 'Not Found' }),
+    };
+    this.listener.addAction('BlockActuator', actuatorBlock);
+    this.httpListener.addAction('BlockActuator', actuatorBlock);
     this.listener.addAction('Fineract', {
       priority: 10,
       conditions: [elbv2.ListenerCondition.pathPatterns([`${FINERACT_CONTEXT}/*`])],
