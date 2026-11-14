@@ -90,6 +90,8 @@ sets Fineract's count explicitly, once:
    on every deploy; the property is then not sent and the live count is left alone.
 4. Run the one-off `harness-seed` task (creates reference data, `harness_admin`, the read-only API role and user,
    rotates `mifos`), then the `harness-dbreadergrant` task (creates `reliability_reader`), then scale `traffic` to 1.
+   Run `harness-seed` with the network configuration of the `traffic` service (security group `TrafficSg`, the only
+   source allowed to reach Fineract on 8080); `harness-dbreadergrant` and `harness-dbinit` use the `fineract` service's.
 
 ## Pause and resume
 
