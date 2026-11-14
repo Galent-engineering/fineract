@@ -18,7 +18,7 @@ const build = () => {
     data,
     dns,
     fineractRepo: buildStack.fineractRepo,
-    fineractImageTag: 'abc123',
+    fineractImageTag: 'abc123', trafficRepo: buildStack.trafficRepo, trafficImageTag: 'abc123',
   });
   return { dns: Template.fromStack(dns), app: Template.fromStack(appStack), data: Template.fromStack(data) };
 };

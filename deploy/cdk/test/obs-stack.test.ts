@@ -17,7 +17,7 @@ const synth = () => {
   const data = new DataStack(app, 'HarnessData', { env, allowedCidrs: config.allowedCidrs });
   const dns = new DnsStack(app, 'HarnessDns', { env });
   const appStack = new AppStack(app, 'HarnessApp', {
-    env, data, dns, fineractRepo: build.fineractRepo, fineractImageTag: 'abc123',
+    env, data, dns, fineractRepo: build.fineractRepo, fineractImageTag: 'abc123', trafficRepo: build.trafficRepo, trafficImageTag: 'abc123',
   });
   const obs = new ObsStack(app, 'HarnessObs', { env, data, app: appStack });
   return { app: Template.fromStack(appStack), obs: Template.fromStack(obs) };

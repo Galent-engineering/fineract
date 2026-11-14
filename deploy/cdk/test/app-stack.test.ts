@@ -18,7 +18,7 @@ const synth = () => {
     data,
     dns,
     fineractRepo: build.fineractRepo,
-    fineractImageTag: 'abc123',
+    fineractImageTag: 'abc123', trafficRepo: build.trafficRepo, trafficImageTag: 'abc123',
   });
   return Template.fromStack(stack);
 };
@@ -40,9 +40,9 @@ describe('AppStack', () => {
     });
   });
 
-  test('circuit breaker with rollback on the Fineract and webapp services (I-5)', () => {
+  test('circuit breaker with rollback on the Fineract, webapp and traffic services (I-5)', () => {
     const svcs = Object.values(t.findResources('AWS::ECS::Service'));
-    expect(svcs).toHaveLength(2);
+    expect(svcs).toHaveLength(3);
     for (const s of svcs) {
       expect(s.Properties.DeploymentConfiguration.DeploymentCircuitBreaker).toEqual({ Enable: true, Rollback: true });
     }
@@ -153,5 +153,53 @@ describe('AppStack', () => {
 
     test('no secret values in template', () => {
     expect(JSON.stringify(t.toJSON())).not.toMatch(/"SecretString"\s*:\s*"[^{]/);
+  });
+
+  describe('Task 8: traffic, seed, db-reader-grant', () => {
+    test('traffic SG may reach the Fineract tasks on 8080 only', () => {
+      const ing = Object.values(t.findResources('AWS::EC2::SecurityGroupIngress')).filter((r: any) =>
+        JSON.stringify(r.Properties.SourceSecurityGroupId ?? '').includes('TrafficSg'),
+      );
+      expect(ing).toHaveLength(1);
+      expect((ing[0] as any).Properties).toMatchObject({ FromPort: 8080, ToPort: 8080, IpProtocol: 'tcp' });
+    });
+
+    test('Fineract registers in Cloud Map as fineract.harness.local', () => {
+      t.hasResourceProperties('AWS::ServiceDiscovery::Service', { Name: 'fineract' });
+      const traffic = byFamilyPrefix(t, 'harness-traffic').Properties.ContainerDefinitions[0];
+      const env = Object.fromEntries(traffic.Environment.map((e: any) => [e.Name, e.Value]));
+      expect(env.FINERACT_BASE_URL).toBe('http://fineract.harness.local:8080');
+      expect(env.RATE_PER_MIN).toBe('6');
+    });
+
+    test('ADOT Java agent samples 25% of traces (parent-based)', () => {
+      const env = Object.fromEntries(
+        byFamilyPrefix(t, 'harness-fineract').Properties.ContainerDefinitions.find((c: any) => c.Name === 'fineract').Environment.map(
+          (e: any) => [e.Name, e.Value],
+        ),
+      );
+      expect(env.OTEL_TRACES_SAMPLER).toBe('parentbased_traceidratio');
+      expect(env.OTEL_TRACES_SAMPLER_ARG).toBe('0.25');
+    });
+
+    test('new generated secrets exist with DESTROY removal', () => {
+      for (const name of ['harness/fineract/reliability-api', 'harness/fineract/mifos']) {
+        const r = Object.values(t.findResources('AWS::SecretsManager::Secret')).find(
+          (x: any) => x.Properties.Name === name,
+        ) as any;
+        expect(r).toBeDefined();
+        expect(r.DeletionPolicy).toBe('Delete');
+        expect(r.Properties.GenerateSecretString.GenerateStringKey).toBe('password');
+      }
+    });
+
+    test('seed and db-reader-grant task definitions exist; reader SQL grants only SELECT', () => {
+      const seed = byFamilyPrefix(t, 'harness-seed').Properties.ContainerDefinitions[0];
+      expect(seed.Command).toEqual(['python', '-m', 'harness_traffic.seed']);
+      const grant = byFamilyPrefix(t, 'harness-dbreadergrant').Properties.ContainerDefinitions[0];
+      const sql = grant.Environment.find((e: any) => e.Name === 'READER_SQL').Value as string;
+      expect(sql).toMatch(/GRANT SELECT ON ALL TABLES/);
+      expect(sql).not.toMatch(/INSERT|UPDATE|DELETE|ALL PRIVILEGES/i);
+    });
   });
 });

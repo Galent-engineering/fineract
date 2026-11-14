@@ -8,6 +8,7 @@ import * as targets from 'aws-cdk-lib/aws-route53-targets';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as aps from 'aws-cdk-lib/aws-aps';
+import * as sd from 'aws-cdk-lib/aws-servicediscovery';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
@@ -41,6 +42,9 @@ export const FLUENT_BIT_IMAGE = 'public.ecr.aws/aws-observability/aws-for-fluent
  * JAVA_TOOL_OPTIONS (no Fineract source change).
  */
 export const ADOT_JAVA_AGENT_IMAGE = 'public.ecr.aws/aws-observability/adot-autoinstrumentation-java:v2.33.0';
+/** Cloud Map name of the Fineract service inside the VPC (namespace harness.local). */
+const FINERACT_DNS_LABEL = 'fineract';
+const FINERACT_DNS_NAME = `${FINERACT_DNS_LABEL}.harness.local`;
 const SIDECAR_CONFIG_WRITER_IMAGE = 'busybox:1.37.0';
 const readConfig = (file: string): string => fs.readFileSync(path.join(__dirname, '..', 'config', file), 'utf8');
 
@@ -49,6 +53,11 @@ export interface AppStackProps extends cdk.StackProps {
   dns: DnsStack;
   fineractRepo: ecr.IRepository;
   fineractImageTag: string;
+  trafficRepo: ecr.IRepository;
+  /** Immutable tag (git sha) of harness/traffic; used by the traffic service and the seed task. */
+  trafficImageTag: string;
+  /** Context `trafficDesiredCount` overrides the default of 1 (use 0 until the seed task has run). */
+  trafficDesiredCount?: number;
   /** 0 until db-init has run once, then 1. Context `fineractDesiredCount` overrides the default of 1. */
   fineractDesiredCount?: number;
 }
@@ -62,6 +71,10 @@ export class AppStack extends cdk.Stack {
   public readonly httpListener: elbv2.ApplicationListener;
   public readonly fineractAdminSecret: secretsmanager.Secret;
   public readonly dbInitTaskDef: ecs.FargateTaskDefinition;
+  public readonly seedTaskDef: ecs.FargateTaskDefinition;
+  public readonly dbReaderGrantTaskDef: ecs.FargateTaskDefinition;
+  public readonly trafficService: ecs.FargateService;
+  public readonly trafficSg: ec2.SecurityGroup;
   /** Created here (not in ObsStack) because Fineract's task needs it and ObsStack depends on this stack. */
   public readonly ampWorkspace: aps.CfnWorkspace;
 
@@ -87,6 +100,29 @@ export class AppStack extends cdk.Stack {
       secretName: 'harness/fineract/master',
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       generateSecretString: { passwordLength: 32, excludePunctuation: true },
+    });
+
+    // Read-only Fineract API user for the reliability product (Task 8 creates the user and role).
+    const reliabilityApiSecret = new secretsmanager.Secret(this, 'ReliabilityApiSecret', {
+      secretName: 'harness/fineract/reliability-api',
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      generateSecretString: {
+        secretStringTemplate: JSON.stringify({ username: 'reliability_api' }),
+        generateStringKey: 'password',
+        passwordLength: 32,
+        excludePunctuation: true,
+      },
+    });
+    // New random password for the built-in `mifos` user, so the rotated value is never lost.
+    const mifosSecret = new secretsmanager.Secret(this, 'FineractMifosSecret', {
+      secretName: 'harness/fineract/mifos',
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+      generateSecretString: {
+        secretStringTemplate: JSON.stringify({ username: 'mifos' }),
+        generateStringKey: 'password',
+        passwordLength: 32,
+        excludePunctuation: true,
+      },
     });
 
     const dbHost = data.db.dbInstanceEndpointAddress;
@@ -167,7 +203,10 @@ export class AppStack extends cdk.Stack {
         OTEL_SERVICE_NAME: 'fineract',
         OTEL_EXPORTER_OTLP_ENDPOINT: 'http://localhost:4318',
         OTEL_EXPORTER_OTLP_PROTOCOL: 'http/protobuf',
-        OTEL_TRACES_SAMPLER: 'always_on',
+        // 0.25: with always_on the harness produced ~7,400 traces/h (measured 2026-11-14, 6 journeys/min + Quartz
+        // JDBC root spans), over the ~2,000/h budget. Parent-based so ALB/propagated decisions are honoured.
+        OTEL_TRACES_SAMPLER: 'parentbased_traceidratio',
+        OTEL_TRACES_SAMPLER_ARG: '0.25',
         OTEL_METRICS_EXPORTER: 'none',
         OTEL_LOGS_EXPORTER: 'none',
         OTEL_AWS_APPLICATION_SIGNALS_ENABLED: 'false',
@@ -246,6 +285,12 @@ export class AppStack extends cdk.Stack {
       minHealthyPercent: 0,
       maxHealthyPercent: 100,
       circuitBreaker: { rollback: true },
+      cloudMapOptions: {
+        name: FINERACT_DNS_LABEL,
+        cloudMapNamespace: data.namespace,
+        dnsRecordType: sd.DnsRecordType.A,
+        dnsTtl: cdk.Duration.seconds(10),
+      },
     });
 
     // tasksSg ingress only from albSg on the container port (CfnSecurityGroupIngress avoids a Data<->App cycle).
@@ -256,6 +301,105 @@ export class AppStack extends cdk.Stack {
       fromPort: FINERACT_PORT,
       toPort: FINERACT_PORT,
       description: 'ALB to Fineract',
+    });
+
+    // ---- Traffic generator, seed and db-reader-grant (Task 8) ----
+    // The ALB is IP-allow-listed and tasks have no NAT, so in-VPC clients call Fineract directly on its task port.
+    this.trafficSg = new ec2.SecurityGroup(this, 'TrafficSg', {
+      vpc: data.vpc,
+      description: 'Harness traffic generator and seed tasks',
+      allowAllOutbound: true,
+    });
+    new ec2.CfnSecurityGroupIngress(this, 'TrafficToTasks', {
+      groupId: data.tasksSg.securityGroupId,
+      sourceSecurityGroupId: this.trafficSg.securityGroupId,
+      ipProtocol: 'tcp',
+      fromPort: FINERACT_PORT,
+      toPort: FINERACT_PORT,
+      description: 'Traffic/seed to Fineract (plain HTTP, in-VPC)',
+    });
+    const trafficImage = ecs.ContainerImage.fromEcrRepository(props.trafficRepo, props.trafficImageTag);
+    const internalFineractUrl = `http://${FINERACT_DNS_NAME}:${FINERACT_PORT}`;
+
+    const trafficTaskDef = new ecs.FargateTaskDefinition(this, 'TrafficTaskDef', {
+      family: 'harness-traffic',
+      cpu: 256,
+      memoryLimitMiB: 512,
+      runtimePlatform: { cpuArchitecture: ecs.CpuArchitecture.X86_64, operatingSystemFamily: ecs.OperatingSystemFamily.LINUX },
+    });
+    trafficTaskDef.addContainer('traffic', {
+      image: trafficImage,
+      environment: {
+        FINERACT_BASE_URL: internalFineractUrl,
+        SECRET_ARN: this.fineractAdminSecret.secretArn,
+        RATE_PER_MIN: '6',
+        ERROR_RATE: '0.02',
+        SLOW_RATE: '0.01',
+      },
+      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'traffic', logRetention: logs.RetentionDays.TWO_WEEKS }),
+    });
+    this.fineractAdminSecret.grantRead(trafficTaskDef.taskRole);
+    this.trafficService = new ecs.FargateService(this, 'TrafficService', {
+      serviceName: 'traffic',
+      cluster: this.cluster,
+      taskDefinition: trafficTaskDef,
+      desiredCount: props.trafficDesiredCount ?? Number(this.node.tryGetContext('trafficDesiredCount') ?? 1),
+      assignPublicIp: true,
+      vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
+      securityGroups: [this.trafficSg],
+      minHealthyPercent: 0,
+      maxHealthyPercent: 100,
+      circuitBreaker: { rollback: true },
+    });
+
+    // One-off: seed data + credential rotation + read-only API user + Loan COB job.
+    this.seedTaskDef = new ecs.FargateTaskDefinition(this, 'SeedTaskDef', {
+      family: 'harness-seed',
+      cpu: 256,
+      memoryLimitMiB: 512,
+      runtimePlatform: { cpuArchitecture: ecs.CpuArchitecture.X86_64, operatingSystemFamily: ecs.OperatingSystemFamily.LINUX },
+    });
+    this.seedTaskDef.addContainer('seed', {
+      image: trafficImage,
+      command: ['python', '-m', 'harness_traffic.seed'],
+      environment: { FINERACT_BASE_URL: internalFineractUrl },
+      secrets: {
+        ADMIN_USERNAME: pw(this.fineractAdminSecret, 'username'),
+        ADMIN_PASSWORD: pw(this.fineractAdminSecret, 'password'),
+        API_USERNAME: pw(reliabilityApiSecret, 'username'),
+        API_PASSWORD: pw(reliabilityApiSecret, 'password'),
+        MIFOS_PASSWORD: pw(mifosSecret, 'password'),
+      },
+      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'seed', logRetention: logs.RetentionDays.TWO_WEEKS }),
+    });
+
+    // One-off: grants for the read-only DB role (also creates the role, which Task 4 never did).
+    this.dbReaderGrantTaskDef = new ecs.FargateTaskDefinition(this, 'DbReaderGrantTaskDef', {
+      family: 'harness-dbreadergrant',
+      cpu: 256,
+      memoryLimitMiB: 512,
+      runtimePlatform: { cpuArchitecture: ecs.CpuArchitecture.X86_64, operatingSystemFamily: ecs.OperatingSystemFamily.LINUX },
+    });
+    this.dbReaderGrantTaskDef.addContainer('dbreadergrant', {
+      image: ecs.ContainerImage.fromRegistry('postgres:18'),
+      entryPoint: ['/bin/bash', '-c'],
+      command: [
+        'set -e; printf "%s" "$READER_SQL" > /tmp/db_reader.sql; ' +
+          'psql -v ON_ERROR_STOP=1 -v rpw="$RP" -f /tmp/db_reader.sql; echo db-reader-grant complete',
+      ],
+      environment: {
+        PGHOST: dbHost,
+        PGPORT: '5432',
+        PGDATABASE: 'postgres',
+        PGSSLMODE: 'require',
+        READER_SQL: fs.readFileSync(path.join(__dirname, '..', '..', 'traffic', 'harness_traffic', 'db_reader.sql'), 'utf8'),
+      },
+      secrets: {
+        PGUSER: pw(data.dbAdminSecret, 'username'),
+        PGPASSWORD: pw(data.dbAdminSecret, 'password'),
+        RP: pw(data.dbReaderSecret, 'password'),
+      },
+      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'dbreadergrant', logRetention: logs.RetentionDays.ONE_WEEK }),
     });
 
     this.alb = new elbv2.ApplicationLoadBalancer(this, 'Alb', {

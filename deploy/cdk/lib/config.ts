@@ -50,3 +50,14 @@ export function loadHarnessConfig(app: cdk.App): HarnessConfig {
     fineractImageTag: fineractImageTag,
   };
 }
+
+/** Traffic/seed image tag, pinned like fineractImageTag (immutable: git sha or digest, never "latest"). */
+export function loadTrafficImageTag(app: cdk.App): string {
+  const tag = String(app.node.tryGetContext('trafficImageTag') ?? '').trim();
+  if (tag === '' || tag === 'latest') {
+    throw new HarnessConfigError(
+      'trafficImageTag is required and must be an immutable tag, not "latest" (-c trafficImageTag=<git sha pushed to harness/traffic>)',
+    );
+  }
+  return tag;
+}

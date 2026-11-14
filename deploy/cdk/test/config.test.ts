@@ -1,5 +1,5 @@
 import * as cdk from 'aws-cdk-lib';
-import { loadHarnessConfig } from '../lib/config';
+import { loadTrafficImageTag, loadHarnessConfig } from '../lib/config';
 
 const appWith = (context: Record<string, string>) => new cdk.App({ context });
 const CIDR = { allowedCidrs: '1.2.3.4/32' };
@@ -43,5 +43,13 @@ describe('loadHarnessConfig', () => {
 
   test('rejects the mutable latest tag', () => {
     expect(() => loadHarnessConfig(appWith({ ...CIDR, fineractImageTag: 'latest' }))).toThrow(/fineractImageTag is required/);
+  });
+});
+
+describe('loadTrafficImageTag', () => {
+  test('is required and must not be latest', () => {
+    expect(() => loadTrafficImageTag(appWith({}))).toThrow(/trafficImageTag is required/);
+    expect(() => loadTrafficImageTag(appWith({ trafficImageTag: 'latest' }))).toThrow(/trafficImageTag is required/);
+    expect(loadTrafficImageTag(appWith({ trafficImageTag: 't8-1' }))).toBe('t8-1');
   });
 });

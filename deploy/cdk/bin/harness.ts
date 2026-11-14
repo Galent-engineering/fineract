@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import * as cdk from 'aws-cdk-lib';
-import { loadHarnessConfig } from '../lib/config';
+import { loadHarnessConfig, loadTrafficImageTag } from '../lib/config';
 import { BuildStack } from '../lib/build-stack';
 import { DataStack } from '../lib/data-stack';
 import { DnsStack } from '../lib/dns-stack';
@@ -24,6 +24,8 @@ const appStack = new AppStack(app, 'HarnessApp', {
   dns,
   fineractRepo: build.fineractRepo,
   fineractImageTag: config.fineractImageTag,
+  trafficRepo: build.trafficRepo,
+  trafficImageTag: loadTrafficImageTag(app),
 });
 new ObsStack(app, 'HarnessObs', {
   env: { account: config.account, region: config.region },
