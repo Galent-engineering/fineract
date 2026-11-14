@@ -233,3 +233,16 @@ this README, runs nothing), and on manual dispatch. Runs are serialised per ref 
     --query 'taskDefinition.containerDefinitions[?name==`fineract`].image' --output text
   # same for the traffic service: --services traffic and containerDefinitions[?name==`traffic`]
   ```
+
+## App Mod estate project
+
+- **Platform:** the local Galent platform, App Mod. The project is "Fineract Core Banking", id `6af7d03a9e53993ec9b861f0`. Its source is `Galent-engineering/fineract`, branch `galent/reliability-harness`, mapped to one application, "fineract".
+- **Ingestion** (8,194 files, 1.21M lines, 27 languages, 55 components):
+
+  | Ingested | Metadata only | Excluded | Failed |
+  |---|---|---|---|
+  | 8,039 | 495 | 23 | 1 |
+
+- **Code enrichment:** completed. Of the eligible files, 1,790 were enriched by the model. Cost was $16.57 on `claude-haiku-4-5`.
+- **Estate discovery:** completed, 22 of 22 sections, after a platform fix for section A2 "Capabilities & features", whose output was cut off on large estates. Discovery cost about $13.24 across the first run and three retries.
+- **Discovery results:** 43 capabilities, 5 personas, 365 data tables, 26 integrations, 38 transactions, 30 endpoints.
