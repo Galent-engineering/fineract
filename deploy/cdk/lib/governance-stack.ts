@@ -18,7 +18,7 @@ export interface ReaderStatement { actions: string[]; resources: string[] }
 /**
  * The reader role's whole policy: read/query/describe only, scoped to the harness wherever AWS supports
  * resource-level permissions. Still account-wide because the services have no resource-level support for
- * these actions: xray, cloudwatch, config, resource-explorer-2, resiliencehub, fis, elasticloadbalancing,
+ * these actions: xray, cloudwatch, resource-explorer-2, resiliencehub, fis, elasticloadbalancing,
  * and the name-only listings (ecs ListClusters, logs DescribeLogGroups/GetQueryResults,
  * rds DescribeEvents/DescribeDBClusters and the unfiltered DescribeDBInstances).
  */
@@ -47,7 +47,6 @@ export function readerStatements(p: { account: string; region: string; partition
       actions: [
         'xray:Get*', 'xray:BatchGet*',
         'cloudwatch:Get*', 'cloudwatch:List*', 'cloudwatch:Describe*',
-        'config:Get*', 'config:List*', 'config:Select*', 'config:BatchGet*',
         'resource-explorer-2:Search', 'resource-explorer-2:Get*', 'resource-explorer-2:List*',
         'resiliencehub:Describe*', 'resiliencehub:List*',
         'fis:Get*', 'fis:List*',

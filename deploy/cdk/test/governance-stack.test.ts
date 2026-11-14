@@ -33,7 +33,6 @@ const actionsOf = (stmts: any[]) => stmts.flatMap((s) => (Array.isArray(s.Action
 const EXPECTED_READER_ACTIONS = [
   'aps:GetLabels', 'aps:GetMetricMetadata', 'aps:GetSeries', 'aps:QueryMetrics',
   'cloudwatch:Describe*', 'cloudwatch:Get*', 'cloudwatch:List*',
-  'config:BatchGet*', 'config:Get*', 'config:List*', 'config:Select*',
   'ecs:DescribeClusters', 'ecs:DescribeServices', 'ecs:DescribeTasks',
   'ecs:ListClusters', 'ecs:ListServices', 'ecs:ListTasks',
   'elasticloadbalancing:Describe*',
@@ -44,7 +43,7 @@ const EXPECTED_READER_ACTIONS = [
   'resource-explorer-2:Get*', 'resource-explorer-2:List*', 'resource-explorer-2:Search',
   'xray:BatchGet*', 'xray:Get*',
 ].sort();
-const SERVICE_ALLOWLIST = ['aps', 'xray', 'logs', 'cloudwatch', 'config', 'resource-explorer-2', 'resiliencehub', 'fis', 'ecs', 'rds', 'elasticloadbalancing'];
+const SERVICE_ALLOWLIST = ['aps', 'xray', 'logs', 'cloudwatch', 'resource-explorer-2', 'resiliencehub', 'fis', 'ecs', 'rds', 'elasticloadbalancing'];
 
 describe('reader role', () => {
   const reader: any = roleOf('harness-reliability-reader');
@@ -56,6 +55,11 @@ describe('reader role', () => {
 
   test('holds exactly the approved action set (equality, not a verb heuristic)', () => {
     expect([...actions].sort()).toEqual(EXPECTED_READER_ACTIONS);
+  });
+
+  test('holds no AWS Config action (historic config items from other teams in the shared account)', () => {
+    expect(actions.filter((a) => a.toLowerCase().startsWith('config:'))).toEqual([]);
+    expect(JSON.stringify(stmts)).not.toMatch(/config:/i);
   });
 
   test('every action is in the service allowlist; no secret-store, KMS, S3, SSM or IAM access', () => {

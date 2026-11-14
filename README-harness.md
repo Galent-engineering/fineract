@@ -189,9 +189,9 @@ The connector user `harness-reliability-connector` can only `sts:AssumeRole` int
   not granted: IAM cannot scope it (it is evaluated on `*`), and other teams' task definitions carry plaintext
   environment variables. Image, cpu and memory are still visible through `DescribeServices`/`DescribeTasks`.
 - AMP: query/get on the harness workspace only. RDS: `DescribeDBInstances` on the harness instance.
-- **Still account-wide** (no resource-level support): X-Ray, CloudWatch metrics, AWS Config (reads recorded
-  resources, including IAM roles), Resource Explorer search, Resilience Hub, FIS, ELB describe, and name-only
+- **Still account-wide** (no resource-level support): X-Ray, CloudWatch metrics, Resource Explorer search, Resilience Hub, FIS, ELB describe, and name-only
   listings (`ecs:ListClusters`, `logs:DescribeLogGroups`, `rds:DescribeEvents`).
+- AWS Config reads are deliberately not granted, because of historic configuration items from other teams in the shared account. Re-add them only with a Config reader adapter and after those items leave retention.
 - The Resource Explorer index and default view are reused, not managed here; deleting them breaks `Search`.
 
 ## CI deploy
