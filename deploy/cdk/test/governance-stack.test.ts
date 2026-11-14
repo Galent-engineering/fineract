@@ -34,8 +34,8 @@ const EXPECTED_READER_ACTIONS = [
   'aps:GetLabels', 'aps:GetMetricMetadata', 'aps:GetSeries', 'aps:QueryMetrics',
   'cloudwatch:Describe*', 'cloudwatch:Get*', 'cloudwatch:List*',
   'config:BatchGet*', 'config:Get*', 'config:List*', 'config:Select*',
-  'ecs:DescribeClusters', 'ecs:DescribeServices', 'ecs:DescribeTaskDefinition', 'ecs:DescribeTasks',
-  'ecs:ListClusters', 'ecs:ListServices', 'ecs:ListTaskDefinitionFamilies', 'ecs:ListTaskDefinitions', 'ecs:ListTasks',
+  'ecs:DescribeClusters', 'ecs:DescribeServices', 'ecs:DescribeTasks',
+  'ecs:ListClusters', 'ecs:ListServices', 'ecs:ListTasks',
   'elasticloadbalancing:Describe*',
   'fis:Get*', 'fis:List*',
   'logs:DescribeLogGroups', 'logs:DescribeLogStreams', 'logs:FilterLogEvents', 'logs:GetQueryResults', 'logs:StartQuery',
@@ -88,13 +88,15 @@ describe('reader role', () => {
     }
   });
 
-  test('ECS reads are scoped to the harness clusters and harness-* task definition families', () => {
+  test('ECS reads are scoped to the harness clusters; task definitions are not readable at all', () => {
     for (const a of ['ecs:DescribeClusters', 'ecs:ListServices', 'ecs:ListTasks', 'ecs:DescribeServices', 'ecs:DescribeTasks']) {
       for (const r of resourcesOf(a)) expect(JSON.stringify(r)).toMatch(/(cluster|service|task)\/harness(-obs)?(\/|")/);
     }
-    const td = resourcesOf('ecs:DescribeTaskDefinition');
-    expect(td).toHaveLength(1);
-    expect(JSON.stringify(td[0])).toContain('task-definition/harness-*:*');
+    // ecs:DescribeTaskDefinition has no resource-level support (IAM evaluates it on "*"), and task definitions of other
+    // workloads carry plaintext environment variables, so it is not granted: no wildcard escape hatch.
+    for (const a of ['ecs:DescribeTaskDefinition', 'ecs:ListTaskDefinitions', 'ecs:ListTaskDefinitionFamilies', 'ecs:Describe*', 'ecs:List*']) {
+      expect(actions).not.toContain(a);
+    }
   });
 
   test('AMP queries are scoped to the harness workspace, RDS describe to the harness instance', () => {

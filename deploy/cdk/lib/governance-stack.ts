@@ -19,7 +19,7 @@ export interface ReaderStatement { actions: string[]; resources: string[] }
  * The reader role's whole policy: read/query/describe only, scoped to the harness wherever AWS supports
  * resource-level permissions. Still account-wide because the services have no resource-level support for
  * these actions: xray, cloudwatch, config, resource-explorer-2, resiliencehub, fis, elasticloadbalancing,
- * and the name-only listings (ecs List clusters/task definitions, logs DescribeLogGroups/GetQueryResults,
+ * and the name-only listings (ecs ListClusters, logs DescribeLogGroups/GetQueryResults,
  * rds DescribeEvents).
  */
 export function readerStatements(p: { account: string; region: string; partition: string; ampWorkspaceArn: string; dbArn: string }): ReaderStatement[] {
@@ -31,13 +31,13 @@ export function readerStatements(p: { account: string; region: string; partition
     // Logs: /harness* log groups only. (An unscoped DescribeLogGroups / GetQueryResults reveals names and ids, not events.)
     { actions: ['logs:FilterLogEvents', 'logs:StartQuery', 'logs:DescribeLogStreams'], resources: [logGroup, `${logGroup}:*`] },
     { actions: ['logs:DescribeLogGroups', 'logs:GetQueryResults'], resources: ['*'] },
-    // ECS: the two harness clusters and harness-* task definition families (other teams' task definitions
-    // carry plaintext environment variables, so DescribeTaskDefinition must not be account-wide).
+    // ECS: the two harness clusters. ecs:DescribeTaskDefinition is deliberately absent: it has no resource-level
+    // support (IAM evaluates it on "*", verified live), and other workloads' task definitions carry plaintext
+    // environment variables. Image, cpu and memory are still visible through DescribeServices/DescribeTasks.
     { actions: ['ecs:DescribeClusters', 'ecs:ListServices', 'ecs:ListTasks'], resources: [`${ecs}:cluster/harness`, `${ecs}:cluster/harness-obs`] },
     { actions: ['ecs:DescribeServices'], resources: [`${ecs}:service/harness/*`, `${ecs}:service/harness-obs/*`] },
     { actions: ['ecs:DescribeTasks'], resources: [`${ecs}:task/harness/*`, `${ecs}:task/harness-obs/*`] },
-    { actions: ['ecs:DescribeTaskDefinition'], resources: [`${ecs}:task-definition/harness-*:*`] },
-    { actions: ['ecs:ListClusters', 'ecs:ListTaskDefinitions', 'ecs:ListTaskDefinitionFamilies'], resources: ['*'] },
+    { actions: ['ecs:ListClusters'], resources: ['*'] },
     // RDS: the harness instance (DescribeEvents has no resource-level support).
     { actions: ['rds:DescribeDBInstances'], resources: [p.dbArn] },
     { actions: ['rds:DescribeEvents'], resources: ['*'] },
