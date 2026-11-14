@@ -153,7 +153,6 @@ export class ObsStack extends cdk.Stack {
       serviceName: 'obs',
       cluster,
       taskDefinition: taskDef,
-      desiredCount: 1,
       assignPublicIp: true,
       vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
       securityGroups: [data.tasksSg],

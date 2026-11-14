@@ -7,6 +7,7 @@ import { DnsStack } from '../lib/dns-stack';
 import { AppStack } from '../lib/app-stack';
 import { ObsStack } from '../lib/obs-stack';
 import { GovernanceStack } from '../lib/governance-stack';
+import { PauseStack } from '../lib/pause-stack';
 
 const app = new cdk.App();
 // Validates the allow-list at synth time; later stacks are added by later tasks.
@@ -37,4 +38,5 @@ new GovernanceStack(app, 'HarnessGovernance', {
   data,
   app: appStack,
 });
+new PauseStack(app, 'HarnessPause', { env: { account: config.account, region: config.region }, data });
 app.synth();

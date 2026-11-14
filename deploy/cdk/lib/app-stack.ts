@@ -56,9 +56,11 @@ export interface AppStackProps extends cdk.StackProps {
   trafficRepo: ecr.IRepository;
   /** Immutable tag (git sha) of harness/traffic; used by the traffic service and the seed task. */
   trafficImageTag: string;
-  /** Context `trafficDesiredCount` overrides the default of 1 (use 0 until the seed task has run). */
-  trafficDesiredCount?: number;
-  /** 0 until db-init has run once, then 1. Context `fineractDesiredCount` overrides the default of 1. */
+  /**
+   * Desired counts are NOT managed by CloudFormation after creation, so pause.sh/resume.sh survive `cdk deploy`.
+   * Context `fineractDesiredCount` is only meant for the first deploy (0 until db-init has run, then 1 once);
+   * when absent the property is omitted and the live count is left alone.
+   */
   fineractDesiredCount?: number;
 }
 
@@ -271,8 +273,8 @@ export class AppStack extends cdk.Stack {
     router.addMountPoints({ containerPath: '/fbcfg', sourceVolume: 'fbcfg', readOnly: true });
     router.addContainerDependencies({ container: fbInit, condition: ecs.ContainerDependencyCondition.SUCCESS });
 
-    const desired =
-      props.fineractDesiredCount ?? Number(this.node.tryGetContext('fineractDesiredCount') ?? 1);
+    const ctxDesired = this.node.tryGetContext('fineractDesiredCount');
+    const desired = props.fineractDesiredCount ?? (ctxDesired === undefined ? undefined : Number(ctxDesired));
     this.fineractService = new ecs.FargateService(this, 'FineractService', {
       serviceName: 'fineract',
       cluster: this.cluster,
@@ -343,7 +345,6 @@ export class AppStack extends cdk.Stack {
       serviceName: 'traffic',
       cluster: this.cluster,
       taskDefinition: trafficTaskDef,
-      desiredCount: props.trafficDesiredCount ?? Number(this.node.tryGetContext('trafficDesiredCount') ?? 1),
       assignPublicIp: true,
       vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
       securityGroups: [this.trafficSg],
@@ -446,7 +447,6 @@ export class AppStack extends cdk.Stack {
       serviceName: 'webapp',
       cluster: this.cluster,
       taskDefinition: webTaskDef,
-      desiredCount: 1,
       assignPublicIp: true,
       vpcSubnets: { subnetType: ec2.SubnetType.PUBLIC },
       securityGroups: [data.tasksSg],
@@ -493,7 +493,11 @@ export class AppStack extends cdk.Stack {
     // target-group health checks hit the targets directly, so they are unaffected).
     const actuatorBlock = {
       priority: 5,
-      conditions: [elbv2.ListenerCondition.pathPatterns(['/actuator/*', `${FINERACT_CONTEXT}/actuator/*`])],
+      conditions: [
+        elbv2.ListenerCondition.pathPatterns([
+          '/actuator', '/actuator/*', `${FINERACT_CONTEXT}/actuator`, `${FINERACT_CONTEXT}/actuator/*`,
+        ]),
+      ],
       action: elbv2.ListenerAction.fixedResponse(404, { contentType: 'text/plain', messageBody: 'Not Found' }),
     };
     this.listener.addAction('BlockActuator', actuatorBlock);

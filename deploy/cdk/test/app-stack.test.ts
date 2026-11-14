@@ -61,6 +61,14 @@ describe('AppStack', () => {
     expect(r.Properties.Priority).toBeLessThan(10);
     const values = r.Properties.Conditions.flatMap((c: any) => c.PathPatternConfig?.Values ?? []);
     expect(values).toEqual(expect.arrayContaining(['/actuator/*', '/fineract-provider/actuator/*']));
+    // M-A: bare paths must be blocked too; '/x/*' does not match '/x'.
+    expect(values).toEqual(expect.arrayContaining(['/actuator', '/fineract-provider/actuator']));
+  });
+
+  test('no service pins DesiredCount, so a paused count survives cdk deploy (Task 9)', () => {
+    for (const s of Object.values(t.findResources('AWS::ECS::Service'))) {
+      expect(s.Properties).not.toHaveProperty('DesiredCount');
+    }
   });
 
   test('target group health check still targets readiness directly on the targets (I-6)', () => {
