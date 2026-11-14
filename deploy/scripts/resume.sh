@@ -18,10 +18,22 @@ DB=$(aws cloudformation describe-stacks --stack-name HarnessPause \
 [ -n "$DB" ] && [ "$DB" != "None" ] || { echo "HarnessPause stack not deployed" >&2; exit 1; }
 db_status() { aws rds describe-db-instances --db-instance-identifier "$DB" --query 'DBInstances[0].DBInstanceStatus' --output text; }
 
+# Every DB wait is bounded: DB_WAIT_MAX polls x 30 s (default 40 = 20 min), then a clear error. A terminal state
+# (it will never become available/stopped without a human) aborts at once.
+DB_WAIT_MAX=${DB_WAIT_MAX:-40}
+die_if_terminal() { # die_if_terminal <status>
+  case "$1" in
+    failed|storage-full|incompatible-*|inaccessible-encryption-credentials)
+      echo "FAILED: $DB is in terminal state '$1'; fix it in the RDS console, then re-run" >&2; exit 1 ;;
+  esac
+}
+timed_out() { echo "FAILED: timed out after $DB_WAIT_MAX polls waiting for $DB ($1); last status '$2'" >&2; exit 1; }
 # 1. Start the database and wait for it. (Flag stays "true" until the DB is up, so the re-stop Lambda
 #    cannot be fooled; RDS-EVENT-0154 is only raised for the 7-day auto-start, not for a manual start.)
-while :; do
+st=""
+for _ in $(seq 1 "$DB_WAIT_MAX"); do
   st=$(db_status)
+  die_if_terminal "$st"
   case "$st" in
     stopped) aws rds start-db-instance --db-instance-identifier "$DB" >/dev/null; echo "starting $DB" ;;
     available) break ;;
@@ -29,6 +41,7 @@ while :; do
   esac
   sleep 30
 done
+[ "$st" = available ] || timed_out "to become available" "$st"
 aws rds wait db-instance-available --db-instance-identifier "$DB"
 echo "rds available"
 

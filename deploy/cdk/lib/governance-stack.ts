@@ -20,7 +20,7 @@ export interface ReaderStatement { actions: string[]; resources: string[] }
  * resource-level permissions. Still account-wide because the services have no resource-level support for
  * these actions: xray, cloudwatch, config, resource-explorer-2, resiliencehub, fis, elasticloadbalancing,
  * and the name-only listings (ecs ListClusters, logs DescribeLogGroups/GetQueryResults,
- * rds DescribeEvents).
+ * rds DescribeEvents/DescribeDBClusters and the unfiltered DescribeDBInstances).
  */
 export function readerStatements(p: { account: string; region: string; partition: string; ampWorkspaceArn: string; dbArn: string }): ReaderStatement[] {
   const ecs = `arn:${p.partition}:ecs:${p.region}:${p.account}`;
@@ -38,9 +38,10 @@ export function readerStatements(p: { account: string; region: string; partition
     { actions: ['ecs:DescribeServices'], resources: [`${ecs}:service/harness/*`, `${ecs}:service/harness-obs/*`] },
     { actions: ['ecs:DescribeTasks'], resources: [`${ecs}:task/harness/*`, `${ecs}:task/harness-obs/*`] },
     { actions: ['ecs:ListClusters'], resources: ['*'] },
-    // RDS: the harness instance (DescribeEvents has no resource-level support).
-    { actions: ['rds:DescribeDBInstances'], resources: [p.dbArn] },
-    { actions: ['rds:DescribeEvents'], resources: ['*'] },
+    // RDS: describe calls on "*" because the topology and RDS-probe adapters call them without an identifier (an
+    // ARN-scoped grant denies that). Instance/cluster metadata only: no data access, no credentials. p.dbArn is kept
+    // in the signature but no longer needed for scoping.
+    { actions: ['rds:DescribeDBInstances', 'rds:DescribeDBClusters', 'rds:DescribeEvents'], resources: ['*'] },
     // No resource-level support: account-wide, read-only.
     {
       actions: [
@@ -59,12 +60,14 @@ export function readerStatements(p: { account: string; region: string; partition
 
 /** Config records only the harness's resource types (no global recording). */
 export const RECORDED_TYPES = [
-  'AWS::ECS::Service', 'AWS::ECS::Cluster', 'AWS::ECS::TaskDefinition',
+  // No AWS::ECS::TaskDefinition / AWS::IAM::Role: a Config item carries the full task-definition environment
+  // (plaintext variables) and role policy documents for every workload in the shared account, readable through
+  // config:Select* / GetResourceConfigHistory. The reader has no DescribeTaskDefinition for the same reason.
+  'AWS::ECS::Service', 'AWS::ECS::Cluster',
   'AWS::RDS::DBInstance',
   'AWS::ElasticLoadBalancingV2::LoadBalancer', 'AWS::ElasticLoadBalancingV2::Listener',
   'AWS::ElasticLoadBalancingV2::TargetGroup',
   'AWS::EC2::SecurityGroup', 'AWS::EC2::VPC', 'AWS::EC2::Subnet',
-  'AWS::IAM::Role',
 ];
 
 export interface GovernanceStackProps extends cdk.StackProps {

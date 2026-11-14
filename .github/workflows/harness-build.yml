@@ -11,6 +11,10 @@ on:
       - 'build.gradle'
       - 'settings.gradle'
       - 'gradle/**'
+      - 'gradle.properties'
+      - 'static-weaving.gradle'
+      - 'buildSrc/**'
+      - 'custom/**'
       - '.github/workflows/harness-build.yml'
 
 # One run at a time per ref; a queued run waits instead of cancelling the one that is mid-deploy.

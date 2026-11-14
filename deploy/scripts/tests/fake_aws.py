@@ -62,6 +62,10 @@ if svc == "ecs" and op == "wait":
         fail("Waiter ServicesStable failed: Max attempts exceeded", 255)
     out()
 if svc == "rds" and op == "describe-db-instances":
+    seq = st.get("rds_seq")  # optional scripted statuses, one per call; the last one repeats
+    if seq:
+        st["rds_calls"] = st.get("rds_calls", 0) + 1
+        out(seq[min(st["rds_calls"], len(seq)) - 1])
     out(st["rds"])
 if svc == "rds" and op == "stop-db-instance":
     st["rds"] = "stopped"
@@ -70,6 +74,8 @@ if svc == "rds" and op == "start-db-instance":
     st["rds"] = "available"
     out()
 if svc == "rds" and op == "wait":
+    out()
+if svc == "sleep":
     out()
 if svc == "secretsmanager":
     out(json.dumps({"username": "u", "password": "p"}))

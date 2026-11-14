@@ -21,13 +21,37 @@ DB=$(aws cloudformation describe-stacks --stack-name HarnessPause \
 [ -n "$DB" ] && [ "$DB" != "None" ] || { echo "HarnessPause stack not deployed" >&2; exit 1; }
 
 db_status() { aws rds describe-db-instances --db-instance-identifier "$DB" --query 'DBInstances[0].DBInstanceStatus' --output text; }
+# Every DB wait is bounded: DB_WAIT_MAX polls x 30 s (default 40 = 20 min), then a clear error. A terminal state
+# (it will never become available/stopped without a human) aborts at once.
+DB_WAIT_MAX=${DB_WAIT_MAX:-40}
+die_if_terminal() { # die_if_terminal <status>
+  case "$1" in
+    failed|storage-full|incompatible-*|inaccessible-encryption-credentials)
+      echo "FAILED: $DB is in terminal state '$1'; fix it in the RDS console, then re-run" >&2; exit 1 ;;
+  esac
+}
+timed_out() { echo "FAILED: timed out after $DB_WAIT_MAX polls waiting for $DB ($1); last status '$2'" >&2; exit 1; }
 wait_db() { # wait_db <status>
-  while [ "$(db_status)" != "$1" ]; do echo "  rds: $(db_status) (waiting for $1)"; sleep 30; done
+  local i st=""
+  for i in $(seq 1 "$DB_WAIT_MAX"); do
+    st=$(db_status)
+    [ "$st" = "$1" ] && return 0
+    die_if_terminal "$st"
+    echo "  rds: $st (waiting for $1)"; sleep 30
+  done
+  timed_out "to reach $1" "$st"
 }
 
 # 1. Save current counts. Never overwrite an existing snapshot while already paused (a re-run after a partial
 #    failure would otherwise record the half-scaled 0s), and never record an all-zero state.
-already=$(aws ssm get-parameter --name /harness/paused --query Parameter.Value --output text 2>/dev/null || echo false)
+# Only ParameterNotFound means "not paused"; any other read error (throttling, auth) aborts before anything changes.
+if already=$(aws ssm get-parameter --name /harness/paused --query Parameter.Value --output text 2>&1); then
+  :
+elif printf '%s' "$already" | grep -q ParameterNotFound; then
+  already=false
+else
+  echo "FAILED: cannot read /harness/paused: $already" >&2; exit 1
+fi
 counts='{}'; total=0
 for cs in $SERVICES; do
   c=${cs%%:*}; s=${cs##*:}
@@ -63,14 +87,17 @@ for cs in $SERVICES; do
   echo "$s: 0 running"
 done
 
-# 4. Stop the database (wait out transitional states first).
-while :; do
+# 4. Stop the database (wait out transitional states first, bounded).
+st=""
+for _ in $(seq 1 "$DB_WAIT_MAX"); do
   st=$(db_status)
+  die_if_terminal "$st"
   case "$st" in
     available) aws rds stop-db-instance --db-instance-identifier "$DB" >/dev/null; echo "stopping $DB"; break ;;
     stopped|stopping) break ;;
     *) echo "  rds: $st (waiting)"; sleep 30 ;;
   esac
 done
+case "$st" in available|stopped|stopping) ;; *) timed_out "to leave '$st'" "$st" ;; esac
 wait_db stopped
 echo "paused: services at 0, $DB stopped"

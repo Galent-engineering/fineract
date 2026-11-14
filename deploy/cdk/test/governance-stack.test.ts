@@ -5,7 +5,7 @@ import { BuildStack } from '../lib/build-stack';
 import { DataStack } from '../lib/data-stack';
 import { DnsStack } from '../lib/dns-stack';
 import { AppStack } from '../lib/app-stack';
-import { GovernanceStack } from '../lib/governance-stack';
+import { GovernanceStack, RECORDED_TYPES } from '../lib/governance-stack';
 
 const synth = () => {
   const app = new cdk.App({ context: { allowedCidrs: '203.0.113.7/32', fineractImageTag: 'abc123' } });
@@ -39,7 +39,7 @@ const EXPECTED_READER_ACTIONS = [
   'elasticloadbalancing:Describe*',
   'fis:Get*', 'fis:List*',
   'logs:DescribeLogGroups', 'logs:DescribeLogStreams', 'logs:FilterLogEvents', 'logs:GetQueryResults', 'logs:StartQuery',
-  'rds:DescribeDBInstances', 'rds:DescribeEvents',
+  'rds:DescribeDBClusters', 'rds:DescribeDBInstances', 'rds:DescribeEvents',
   'resiliencehub:Describe*', 'resiliencehub:List*',
   'resource-explorer-2:Get*', 'resource-explorer-2:List*', 'resource-explorer-2:Search',
   'xray:BatchGet*', 'xray:Get*',
@@ -99,15 +99,19 @@ describe('reader role', () => {
     }
   });
 
-  test('AMP queries are scoped to the harness workspace, RDS describe to the harness instance', () => {
+  test('AMP queries are scoped to the harness workspace; RDS is describe-only', () => {
     for (const a of ['aps:QueryMetrics', 'aps:GetSeries', 'aps:GetLabels', 'aps:GetMetricMetadata']) {
       const res = resourcesOf(a);
       expect(res).toHaveLength(1);
       expect(JSON.stringify(res[0])).toContain('AmpWorkspace');
     }
+    // The unfiltered describe (no identifier) needs "*" and returns metadata only.
     const rds = resourcesOf('rds:DescribeDBInstances');
-    expect(rds).toHaveLength(1);
-    expect(JSON.stringify(rds[0])).toContain('HarnessData');
+    expect(rds).toEqual(['*']);
+    expect(resourcesOf('rds:DescribeDBClusters')).toEqual(['*']);
+    // Describe only: no data-plane or write RDS action.
+    expect(actions.filter((a) => a.startsWith('rds:')).sort()).toEqual(
+      ['rds:DescribeDBClusters', 'rds:DescribeDBInstances', 'rds:DescribeEvents']);
   });
 
   test('trust policy is the connector user with an sts:ExternalId condition', () => {
@@ -143,6 +147,22 @@ describe('config, resilience, fis', () => {
     expect(calls).toContain('startConfigurationRecorder');
     expect(calls).toContain('AWS::ECS::Service');
     expect(calls).toContain('\\"allSupported\\":false');
+  });
+  test('config recorder does not record ECS task definitions or IAM roles (env vars / policy documents)', () => {
+    const calls = JSON.stringify(Object.values(t.findResources('Custom::AWS')).map((r: any) => r.Properties.Create));
+    expect(calls).not.toContain('AWS::ECS::TaskDefinition');
+    expect(calls).not.toContain('AWS::IAM::Role');
+    expect([...RECORDED_TYPES].sort()).toEqual([
+      'AWS::EC2::SecurityGroup', 'AWS::EC2::Subnet', 'AWS::EC2::VPC',
+      'AWS::ECS::Cluster', 'AWS::ECS::Service',
+      'AWS::ElasticLoadBalancingV2::Listener', 'AWS::ElasticLoadBalancingV2::LoadBalancer', 'AWS::ElasticLoadBalancingV2::TargetGroup',
+      'AWS::RDS::DBInstance',
+    ]);
+  });
+  test('recorder custom resource re-runs putConfigurationRecorder on update', () => {
+    const rec: any = Object.values(t.findResources('Custom::AWS')).find((r: any) => JSON.stringify(r.Properties.Create).includes('putConfigurationRecorder'));
+    expect(JSON.stringify(rec.Properties.Update)).toContain('putConfigurationRecorder');
+    expect(JSON.stringify(rec.Properties.Update)).toBe(JSON.stringify(rec.Properties.Create));
   });
   test('resilience hub app and policy (RTO 900s / RPO 300s)', () => {
     t.hasResourceProperties('AWS::ResilienceHub::App', { Name: 'fineract-harness' });
