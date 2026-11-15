@@ -161,8 +161,11 @@ def test_pause_ssm_read_error_other_than_not_found_aborts_without_touching_anyth
 
 # ---- demo.sh ----------------------------------------------------------------------------------------------------------
 
-def live(status="running", tpl="EXT-DB", start="2026-11-15T10:00:00+00:00", id_="EXP-OLD"):
-    return {"id": id_, "experimentTemplateId": tpl, "state": {"status": status}, "startTime": start}
+def live(status="running", tpl="EXT-DB", start="2026-11-15T10:00:00+00:00", id_="EXP-OLD", name="db-outage"):
+    """tpl=EXT-OTHER makes a foreign (untagged) experiment; scenario experiments carry the harness-scenario tag."""
+    e = {"id": id_, "experimentTemplateId": tpl, "state": {"status": status}, "startTime": start}
+    e["tags"] = {} if tpl == "EXT-OTHER" else {"harness-scenario": name}
+    return e
 
 
 def test_demo_on_and_off_set_the_rate_and_print_before_after(env):
@@ -254,7 +257,7 @@ def test_demo_final_wait_for_fineract_is_bounded(env):
 
 def test_demo_status_shows_rate_counts_and_experiments(env):
     p, st = env("demo.sh", "status", ssm={"/harness/traffic/rate_per_min": "60"},
-                experiments=[live("running"), live("completed", tpl="EXT-SLOW", start="2026-11-14T10:00:00+00:00", id_="EXP-PREV")])
+                experiments=[live("running"), live("completed", tpl="EXT-SLOW", start="2026-11-14T10:00:00+00:00", id_="EXP-PREV", name="slowdown")])
     assert p.returncode == 0, p.stderr
     out = p.stdout
     assert "traffic rate per minute: 60" in out
@@ -278,3 +281,40 @@ def test_demo_stop_with_nothing_running_is_a_noop(env):
 def test_demo_accepts_profile_flag(env):
     p, st = env("demo.sh", "--profile", "other", "status")
     assert p.returncode == 0, p.stderr
+
+
+def test_demo_finds_a_running_experiment_by_its_tag_even_if_its_template_was_replaced(env):
+    p, st = env("demo.sh", "slowdown", experiments=[live("running", tpl="EXT-GONE")])
+    assert p.returncode == 1
+    assert "already running" in p.stderr
+    p, st = env("demo.sh", "stop", experiments=[live("running", tpl="EXT-GONE")])
+    assert st["stopped"] == ["EXP-OLD"]
+
+
+def test_demo_refuses_network_scenarios_until_the_fault_agent_registered(env):
+    for name in ("db-outage", "slowdown"):
+        p, st = env("demo.sh", name, mi_task_arns={"mi-1": "arn:aws:ecs:us-east-1:111111111111:task/harness/OLDTASK"})
+        assert p.returncode == 1
+        assert "fault agent still registering" in p.stderr and "retry in a minute" in p.stderr
+        assert "started" not in st
+    p, st = env("demo.sh", "slowdown", managed_instances=[])
+    assert p.returncode == 1 and "fault agent still registering" in p.stderr
+
+
+def test_demo_crash_does_not_need_the_fault_agent(env):
+    p, st = env("demo.sh", "crash", managed_instances=[], exp_seq=["completed"])
+    assert p.returncode == 0, p.stderr
+
+
+def test_demo_tolerates_two_failed_polls_but_not_three(env):
+    p, st = env("demo.sh", "slowdown", exp_seq=["ERR", "ERR", "completed"])
+    assert p.returncode == 0, p.stderr
+    p, st = env("demo.sh", "slowdown", exp_seq=["ERR"])
+    assert p.returncode == 1
+    assert "cannot read experiment" in p.stderr
+    assert st["exp_calls"] == 3
+
+
+def test_demo_slowdown_hint_matches_the_readme(env):
+    p, st = env("demo.sh", "slowdown", exp_seq=["completed"])
+    assert "about 200 ms added per database round trip" in p.stdout

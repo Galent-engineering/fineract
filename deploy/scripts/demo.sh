@@ -39,21 +39,33 @@ template_id() {
 t=[x["id"] for x in json.load(sys.stdin).get("experimentTemplates",[]) if (x.get("tags") or {}).get("harness-scenario")==sys.argv[1]]
 print(t[0] if t else "")' "$1"
 }
-# Lists scenario experiments (those started from a harness-scenario template) as "id status startTime scenario", newest first.
-# $1 = all | active
+# Lists scenario experiments (identified by the experiment's own harness-scenario tag, which start-experiment sets, so a
+# replaced template cannot hide a running one) as "id status startTime scenario", newest first. $1 = all | active
 scenario_experiments() {
-  local templates experiments
-  templates=$(aws fis list-experiment-templates --output json)
+  local experiments
   experiments=$(aws fis list-experiments --output json)
   python3 -c 'import json,sys
-tpl={x["id"]:x["tags"]["harness-scenario"] for x in json.loads(sys.argv[1]).get("experimentTemplates",[]) if (x.get("tags") or {}).get("harness-scenario")}
-ex=[e for e in json.loads(sys.argv[2]).get("experiments",[]) if e.get("experimentTemplateId") in tpl]
+ex=[e for e in json.loads(sys.argv[1]).get("experiments",[]) if (e.get("tags") or {}).get("harness-scenario")]
 ex.sort(key=lambda e:str(e.get("startTime","")),reverse=True)
 live={"pending","initiating","running","stopping"}
 for e in ex:
     st=e.get("state",{}).get("status","?")
-    if sys.argv[3]=="active" and st not in live: continue
-    print(e["id"],st,e.get("startTime","-"),tpl[e["experimentTemplateId"]])' "$templates" "$experiments" "$1"
+    if sys.argv[2]=="active" and st not in live: continue
+    print(e["id"],st,e.get("startTime","-"),e["tags"]["harness-scenario"])' "$experiments" "$1"
+}
+# True when an online SSM managed instance carries the ECS_TASK_ARN tag of Fineract's current task (the FIS sidecar has registered).
+fault_agent_ready() {
+  local task ids id tags
+  task=$(aws ecs list-tasks --cluster harness --service-name fineract --desired-status RUNNING --query 'taskArns[0]' --output text)
+  [ -n "$task" ] && [ "$task" != None ] || return 1
+  ids=$(aws ssm describe-instance-information --filters Key=ResourceType,Values=ManagedInstance Key=PingStatus,Values=Online \
+    --query 'InstanceInformationList[].InstanceId' --output text)
+  for id in $ids; do
+    tags=$(aws ssm list-tags-for-resource --resource-type ManagedInstance --resource-id "$id" \
+      --query "TagList[?Key=='ECS_TASK_ARN'].Value" --output text 2>/dev/null || true)
+    [ "$tags" = "$task" ] && return 0
+  done
+  return 1
 }
 
 case "$CMD" in
@@ -100,6 +112,11 @@ case "$CMD" in
       echo "REFUSED: a scenario experiment is already running:" >&2; printf '%s\n' "$active" | sed 's/^/  /' >&2
       echo "Wait for it to finish or run: $0 stop" >&2; exit 1
     fi
+    if [ "$CMD" != crash ] && ! fault_agent_ready; then
+      echo "REFUSED: fault agent still registering (no online SSM instance for Fineract's current task); retry in a minute." >&2
+      echo "The agent registers a few minutes after a task starts (after a deploy, resume or crash)." >&2
+      exit 1
+    fi
     tid=$(aws fis list-experiment-templates --output json | template_id "$CMD")
     [ -n "$tid" ] || { echo "FAILED: no FIS template tagged harness-scenario=$CMD (is HarnessApp deployed with the demo scenarios?)" >&2; exit 1; }
 
@@ -116,15 +133,23 @@ case "$CMD" in
         echo "look for:    Fineract still answers HTTP but API calls return 5xx (database unreachable); traffic journeys start failing." ;;
       slowdown)
         echo "expected end: $(fmt $((started + SCENARIO_MIN * 60))) (hard duration ${SCENARIO_MIN} min, reverts on its own)"
-        echo "look for:    response times jump by seconds, requests still succeed." ;;
+        echo "look for:    about 200 ms added per database round trip; requests still succeed but slow down." ;;
       crash)
         echo "expected end: immediate; ECS then replaces the task (about 7-10 min until Fineract is healthy again)"
         echo "look for:    the Fineract task stops, requests fail until the replacement is up." ;;
     esac
 
-    status=""
+    status=""; poll_fails=0
     for _ in $(seq 1 "$POLL_MAX"); do
-      status=$(aws fis get-experiment --id "$exp" --query 'experiment.state.status' --output text)
+      # A flaky poll does not matter (the experiment reverts on its own); give up only after 3 failures in a row.
+      if status=$(aws fis get-experiment --id "$exp" --query 'experiment.state.status' --output text 2>/dev/null); then
+        poll_fails=0
+      else
+        poll_fails=$((poll_fails + 1)); status=unknown
+        if [ "$poll_fails" -ge 3 ]; then
+          echo "FAILED: cannot read experiment $exp ($poll_fails polls in a row); it still ends by itself. Check: $0 status" >&2; exit 1
+        fi
+      fi
       case "$status" in completed|stopped|failed|cancelled) break ;; esac
       echo "  experiment: $status"; sleep "$POLL_S"
     done

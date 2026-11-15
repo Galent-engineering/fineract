@@ -82,6 +82,12 @@ if svc == "rds" and op == "start-db-instance":
     out()
 if svc == "rds" and op == "wait":
     out()
+if svc == "ecs" and op == "list-tasks":
+    out(st.get("task_arn", "arn:aws:ecs:us-east-1:111111111111:task/harness/abc"))
+if svc == "ssm" and op == "describe-instance-information":
+    out(" ".join(st.get("managed_instances", ["mi-1"])))
+if svc == "ssm" and op == "list-tags-for-resource":
+    out(st.get("mi_task_arns", {}).get(opt("--resource-id"), "arn:aws:ecs:us-east-1:111111111111:task/harness/abc"))
 if svc == "fis":
     if op == "list-experiment-templates":
         tpl = st.get("templates") or {"db-outage": "EXT-DB", "slowdown": "EXT-SLOW", "crash": "EXT-CRASH"}
@@ -99,7 +105,10 @@ if svc == "fis":
             out("Experiment completed")
         seq = st.get("exp_seq") or ["running", "completed"]
         st["exp_calls"] = st.get("exp_calls", 0) + 1
-        out(seq[min(st["exp_calls"], len(seq)) - 1])
+        v = seq[min(st["exp_calls"], len(seq)) - 1]
+        if v == "ERR":
+            fail("An error occurred (ThrottlingException) when calling the GetExperiment operation")
+        out(v)
     if op == "stop-experiment":
         st.setdefault("stopped", []).append(opt("--id"))
         out("{}")
