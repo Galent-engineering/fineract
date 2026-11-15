@@ -312,6 +312,7 @@ describe('AppStack demo scenarios (FIS)', () => {
     expect(dereg.Condition.StringEquals['ssm:resourceTag/FAULT_INJECTION_SIDECAR']).toBe('true');
     const tag = st.find((s) => acts(s.Action).includes('ssm:AddTagsToResource'));
     expect(tag.Condition.StringEquals['aws:RequestTag/FAULT_INJECTION_SIDECAR']).toBe('true');
+    expect(tag.Condition['ForAllValues:StringEquals']['aws:TagKeys'].sort()).toEqual(['ECS_TASK_ARN', 'ECS_TASK_AVAILABILITY_ZONE', 'FAULT_INJECTION_SIDECAR']);
     expect(st.some((s) => acts(s.Action).includes('ssm:DeleteActivation'))).toBe(true);
     const create = st.find((s) => acts(s.Action).includes('ssm:CreateActivation'));
     expect(acts(create.Action)).toEqual(['ssm:CreateActivation']);

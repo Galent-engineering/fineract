@@ -302,7 +302,10 @@ export class AppStack extends cdk.Stack {
       new iam.PolicyStatement({
         actions: ['ssm:AddTagsToResource'],
         resources: ['*'],
-        conditions: { StringEquals: { 'aws:RequestTag/FAULT_INJECTION_SIDECAR': 'true' } },
+        conditions: {
+          StringEquals: { 'aws:RequestTag/FAULT_INJECTION_SIDECAR': 'true' },
+          'ForAllValues:StringEquals': { 'aws:TagKeys': ['ECS_TASK_AVAILABILITY_ZONE', 'ECS_TASK_ARN', 'FAULT_INJECTION_SIDECAR'] },
+        },
       }),
     );
     taskDef.taskRole.addToPrincipalPolicy(
