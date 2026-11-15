@@ -27,18 +27,41 @@ import { Fn } from 'aws-cdk-lib';
  *                        /fineract-provider/actuator/prometheus (context path /fineract-provider)
  *  - Readiness group:    management.endpoint.health.probes.enabled=true ->
  *                        /fineract-provider/actuator/health/readiness
+ *  - Fail-fast DB access (db-outage demo): a blackholed database makes JDBC wait on the socket forever, so Fineract hangs
+ *                        instead of answering 5xx. Both pools get pgjdbc connectTimeout/socketTimeout (seconds) in their URL
+ *                        parameters; the tenant store pool also gets a 5 s Hikari connectionTimeout.
+ *                        The tenant DB pool takes its parameters from tenant_server_connections.schema_connection_parameters,
+ *                        which Liquibase fills from FINERACT_DEFAULT_TENANTDB_CONN_PARAMS ONLY when the row is first created;
+ *                        an existing row is updated by the harness-dbinit one-off task (app-stack.ts). Its Hikari
+ *                        connectionTimeout is not configurable by property, so a file named by -Dhikaricp.configurationFile
+ *                        sets it (HikariConfig reads that file in its constructor).
  */
 export const FINERACT_PORT = 8080;
 export const FINERACT_CONTEXT = '/fineract-provider';
 export const TENANTS_DB = 'fineract_tenants';
 export const TENANT_DEFAULT_DB = 'fineract_default';
+/**
+ * pgjdbc seconds. socketTimeout bounds every statement, so it must exceed the longest legitimate one: this harness has
+ * small tables, single COB statements are millisecond-scale, and migrations only run on a version change.
+ */
+export const DB_CONNECT_TIMEOUT_S = 5;
+export const DB_SOCKET_TIMEOUT_S = 10;
+/** Tenant store lookups are trivial and cached, so its ceiling is looser. */
+export const STORE_SOCKET_TIMEOUT_S = 30;
+export const DB_CONN_PARAMS = `connectTimeout=${DB_CONNECT_TIMEOUT_S}&socketTimeout=${DB_SOCKET_TIMEOUT_S}`;
+/** Hikari borrow/validation timeouts (ms); the tenant-pool validation interval is a tenants-store column set by dbinit. */
+export const HIKARI_CONNECTION_TIMEOUT_MS = 5000;
+export const TENANT_POOL_VALIDATION_MS = 2000;
+export const HIKARI_PROPERTIES_FILE = '/fbcfg/hikari.properties';
 
 export function fineractEnvironment(dbHost: string): Record<string, string> {
   return {
     JAVA_TOOL_OPTIONS: '-Xmx5g',
     FINERACT_SERVER_SSL_ENABLED: 'false',
     FINERACT_SERVER_PORT: String(FINERACT_PORT),
-    FINERACT_HIKARI_JDBC_URL: `jdbc:postgresql://${dbHost}:5432/${TENANTS_DB}`,
+    FINERACT_HIKARI_JDBC_URL: `jdbc:postgresql://${dbHost}:5432/${TENANTS_DB}?connectTimeout=${DB_CONNECT_TIMEOUT_S}&socketTimeout=${STORE_SOCKET_TIMEOUT_S}`,
+    FINERACT_HIKARI_CONNECTION_TIMEOUT: String(HIKARI_CONNECTION_TIMEOUT_MS),
+    FINERACT_DEFAULT_TENANTDB_CONN_PARAMS: DB_CONN_PARAMS,
     FINERACT_DEFAULT_TENANTDB_HOSTNAME: dbHost,
     FINERACT_DEFAULT_TENANTDB_PORT: '5432',
     FINERACT_DEFAULT_TENANTDB_NAME: TENANT_DEFAULT_DB,

@@ -367,3 +367,47 @@ describe('AppStack demo scenarios (FIS)', () => {
     expect(env).toContainEqual({ Name: 'RATE_PARAM_NAME', Value: '/harness/traffic/rate_per_min' });
   });
 });
+
+describe('AppStack fail-fast database access', () => {
+  const t = synth();
+  const fineractDef = () => byFamilyPrefix(t, 'harness-fineract').Properties;
+  const env = () => {
+    const c = fineractDef().ContainerDefinitions.find((x: any) => x.Name === 'fineract');
+    return Object.fromEntries(c.Environment.map((e: any) => [e.Name, e.Value]));
+  };
+
+  test('tenant store pool: connect/socket timeouts in the JDBC URL and a 5 s Hikari connection timeout', () => {
+    const e = env() as any;
+    const url = JSON.stringify(e.FINERACT_HIKARI_JDBC_URL);
+    expect(url).toContain('connectTimeout=5');
+    expect(url).toContain('socketTimeout=30');
+    expect(e.FINERACT_HIKARI_CONNECTION_TIMEOUT).toBe('5000');
+  });
+
+  test('tenant DB params for fresh installs: connectTimeout=5 and a 10 s socketTimeout', () => {
+    expect((env() as any).FINERACT_DEFAULT_TENANTDB_CONN_PARAMS).toBe('connectTimeout=5&socketTimeout=10');
+  });
+
+  test('Hikari settings file: written by the config init, read-only mounted in Fineract, named in JAVA_TOOL_OPTIONS', () => {
+    const d = fineractDef();
+    const init = d.ContainerDefinitions.find((x: any) => x.Name === 'fb_config_init');
+    expect(JSON.stringify(init.Command)).toContain('/fbcfg/hikari.properties');
+    expect(init.Environment.find((e: any) => e.Name === 'HIKARI_CONNECTION_TIMEOUT').Value).toBe('5000');
+    const c = d.ContainerDefinitions.find((x: any) => x.Name === 'fineract');
+    expect(c.MountPoints).toContainEqual({ ContainerPath: '/fbcfg', ReadOnly: true, SourceVolume: 'fbcfg' });
+    expect(c.DependsOn).toContainEqual({ Condition: 'SUCCESS', ContainerName: 'fb_config_init' });
+    expect((env() as any).JAVA_TOOL_OPTIONS).toContain('-Dhikaricp.configurationFile=/fbcfg/hikari.properties');
+  });
+
+  test('dbinit updates the existing tenant row idempotently and only when the table exists', () => {
+    const script = byFamilyPrefix(t, 'harness-dbinit').Properties.ContainerDefinitions[0].Command[0] as string;
+    expect(script).toContain('\\c fineract_tenants');
+    expect(script).toContain("to_regclass('public.tenant_server_connections')");
+    expect(script).toContain('\\if :has_tsc');
+    expect(script).toContain("NOT LIKE '%socketTimeout=%'");
+    expect(script).toContain("'connectTimeout=5&socketTimeout=10'");
+    expect(script).toContain('pool_validation_interval = 2000');
+    expect(script.indexOf('\\if :has_tsc')).toBeLessThan(script.indexOf('UPDATE tenant_server_connections'));
+    expect(script.indexOf('UPDATE tenant_server_connections')).toBeLessThan(script.indexOf('\\endif'));
+  });
+});

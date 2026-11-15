@@ -22,6 +22,10 @@ import {
   FINERACT_PORT,
   TENANTS_DB,
   TENANT_DEFAULT_DB,
+  DB_CONN_PARAMS,
+  HIKARI_CONNECTION_TIMEOUT_MS,
+  HIKARI_PROPERTIES_FILE,
+  TENANT_POOL_VALIDATION_MS,
   fineractEnvironment,
   substituteToken,
 } from './fineract-env';
@@ -180,6 +184,15 @@ export class AppStack extends cdk.Stack {
       `SELECT 'CREATE DATABASE ${TENANT_DEFAULT_DB} OWNER "$FU"' WHERE NOT EXISTS (SELECT FROM pg_database WHERE datname='${TENANT_DEFAULT_DB}') \\gexec`,
       `GRANT ALL PRIVILEGES ON DATABASE ${TENANTS_DB} TO "$FU";`,
       `GRANT ALL PRIVILEGES ON DATABASE ${TENANT_DEFAULT_DB} TO "$FU";`,
+      // Fail-fast DB access for the EXISTING tenant row (the env value only applies when Liquibase first creates it).
+      // Guarded and idempotent: skipped before Fineract's first boot (no table yet), a no-op once applied.
+      `\\c ${TENANTS_DB}`,
+      `SET ROLE "$FU";`,
+      `SELECT to_regclass('public.tenant_server_connections') IS NOT NULL AS has_tsc \\gset`,
+      `\\if :has_tsc`,
+      `UPDATE tenant_server_connections SET schema_connection_parameters = CASE WHEN COALESCE(TRIM(schema_connection_parameters), '') = '' THEN '${DB_CONN_PARAMS}' ELSE schema_connection_parameters || '&${DB_CONN_PARAMS}' END WHERE schema_connection_parameters IS NULL OR schema_connection_parameters NOT LIKE '%socketTimeout=%';`,
+      `UPDATE tenant_server_connections SET pool_validation_interval = ${TENANT_POOL_VALIDATION_MS} WHERE pool_validation_interval IS DISTINCT FROM ${TENANT_POOL_VALIDATION_MS};`,
+      `\\endif`,
       `EOSQL`,
       `echo db-init complete`,
     ].join('\n');
@@ -237,7 +250,7 @@ export class AppStack extends cdk.Stack {
       portMappings: [{ containerPort: FINERACT_PORT }],
       environment: {
         ...fineractEnvironment(dbHost),
-        JAVA_TOOL_OPTIONS: '-Xmx5g -javaagent:/otel/javaagent.jar',
+        JAVA_TOOL_OPTIONS: `-Xmx5g -javaagent:/otel/javaagent.jar -Dhikaricp.configurationFile=${HIKARI_PROPERTIES_FILE}`,
         OTEL_SERVICE_NAME: 'fineract',
         OTEL_EXPORTER_OTLP_ENDPOINT: 'http://localhost:4318',
         OTEL_EXPORTER_OTLP_PROTOCOL: 'http/protobuf',
@@ -344,8 +357,13 @@ export class AppStack extends cdk.Stack {
       image: ecs.ContainerImage.fromRegistry(SIDECAR_CONFIG_WRITER_IMAGE),
       essential: false,
       entryPoint: ['/bin/sh', '-c'],
-      command: ['printf "%s" "$FLUENT_BIT_CONF" > /fbcfg/fluent-bit.conf && chmod a+r /fbcfg/fluent-bit.conf'],
-      environment: { FLUENT_BIT_CONF: readConfig('fluent-bit.conf') },
+      // Also writes the Hikari settings file Fineract reads (-Dhikaricp.configurationFile): the tenant pool's connection
+      // timeout cannot be set by property, and the default 30 s would keep requests hanging while the DB is unreachable.
+      command: [
+        'printf "%s" "$FLUENT_BIT_CONF" > /fbcfg/fluent-bit.conf && ' +
+          'printf "connectionTimeout=%s\\n" "$HIKARI_CONNECTION_TIMEOUT" > /fbcfg/hikari.properties && chmod a+r /fbcfg/*',
+      ],
+      environment: { FLUENT_BIT_CONF: readConfig('fluent-bit.conf'), HIKARI_CONNECTION_TIMEOUT: String(HIKARI_CONNECTION_TIMEOUT_MS) },
       logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'fb-config-init', logRetention: logs.RetentionDays.ONE_WEEK }),
     });
     fbInit.addMountPoints({ containerPath: '/fbcfg', sourceVolume: 'fbcfg', readOnly: false });
@@ -363,6 +381,9 @@ export class AppStack extends cdk.Stack {
     });
     router.addMountPoints({ containerPath: '/fbcfg', sourceVolume: 'fbcfg', readOnly: true });
     router.addContainerDependencies({ container: fbInit, condition: ecs.ContainerDependencyCondition.SUCCESS });
+    // Fineract reads the Hikari settings file from the same volume, so it must wait for the writer.
+    fineractContainer.addMountPoints({ containerPath: '/fbcfg', sourceVolume: 'fbcfg', readOnly: true });
+    fineractContainer.addContainerDependencies({ container: fbInit, condition: ecs.ContainerDependencyCondition.SUCCESS });
 
     const ctxDesired = this.node.tryGetContext('fineractDesiredCount');
     const desired = props.fineractDesiredCount ?? (ctxDesired === undefined ? undefined : Number(ctxDesired));
