@@ -73,3 +73,62 @@ async def test_run_picks_up_a_new_rate_between_ticks(client, seed_result, monkey
               rng=_Quiet(), rate_source=lambda: next(rates), rate_refresh_s=0)
     # tick1 refresh->60 (1 s interval), tick2 ->60, tick3 ->6 (10 s), tick4: source exhausted would raise
     assert [round(x) for x in sleeps[:3]] == [1, 1, 10]
+
+
+def test_last_good_value_is_used_when_a_later_read_fails():
+    vals = iter(["60"])
+
+    def getter(_):
+        try:
+            return next(vals)
+        except StopIteration:
+            raise RuntimeError("throttled")
+
+    src = make_rate_source("p", 6, getter)
+    assert src() == 60
+    assert src() == 60  # not back to the env 6
+
+
+def test_default_client_has_short_timeouts_and_is_built_once(monkeypatch):
+    built = []
+
+    class FakeSsm:
+        def get_parameter(self, Name):
+            return {"Parameter": {"Value": "30"}}
+
+    def fake_client(name, config=None):
+        built.append(config)
+        return FakeSsm()
+
+    monkeypatch.setattr(rate.boto3, "client", fake_client)
+    src = make_rate_source("p", 6)
+    assert src() == 30 and src() == 30
+    assert len(built) == 1
+    assert built[0].connect_timeout == 3 and built[0].read_timeout == 3
+    assert built[0].retries["max_attempts"] == 1
+
+
+async def test_a_slow_rate_read_does_not_stall_the_loop(client, seed_result, monkeypatch):
+    import time
+
+    from harness_traffic import run as run_mod
+    from harness_traffic.journeys import JourneyOutcome
+
+    async def ok(*_a, **_k):
+        return JourneyOutcome("loan")
+
+    monkeypatch.setattr(run_mod, "run_loan_journey", ok)
+    sleeps: list[float] = []
+
+    async def rec(s: float) -> None:
+        sleeps.append(s)
+
+    def slow() -> float:
+        time.sleep(1.0)
+        return 60.0
+
+    t0 = time.monotonic()
+    await run(client, seed_result, rate_per_min=6, error_rate=0, slow_rate=0, max_ticks=2, sleep=rec, rng=_Quiet(),
+              rate_source=slow, rate_refresh_s=0, rate_timeout_s=0.05)
+    assert time.monotonic() - t0 < 0.9  # the loop did not wait out the 1 s read (2 ticks)
+    assert [round(x) for x in sleeps] == [10, 10]  # rate stayed at the current 6/min

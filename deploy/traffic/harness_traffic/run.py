@@ -22,7 +22,7 @@ from .journeys import (
     run_repayment,
     run_savings_journey,
 )
-from .rate import REFRESH_S, env_rate, make_rate_source
+from .rate import READ_TIMEOUT_S, REFRESH_S, env_rate, make_rate_source
 from .seed import SeedResult, seed
 
 MAX_CONSECUTIVE_FAILURES = 5
@@ -48,6 +48,7 @@ async def run(
     max_ticks: int | None = None,
     rate_source: Callable[[], float] | None = None,
     rate_refresh_s: float = REFRESH_S,
+    rate_timeout_s: float = READ_TIMEOUT_S,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     rng: random.Random | None = None,
 ) -> None:
@@ -62,7 +63,11 @@ async def run(
         started = time.monotonic()
         if rate_source is not None and started - last_refresh >= rate_refresh_s:
             last_refresh = started
-            new_rate = await asyncio.to_thread(rate_source)  # blocking boto3 call stays off the event loop
+            try:  # blocking boto3 call stays off the event loop, and never holds it past the timeout
+                new_rate = await asyncio.wait_for(asyncio.to_thread(rate_source), rate_timeout_s)
+            except asyncio.TimeoutError:
+                log("rate_fallback", reason="read timed out", rate=rate_per_min)
+                new_rate = rate_per_min
             if new_rate != rate_per_min:
                 log("rate_change", old=rate_per_min, new=new_rate)
                 rate_per_min, interval = new_rate, 60.0 / new_rate
@@ -135,7 +140,10 @@ async def main_async() -> None:
     seed_result = await startup_seed(client)
     fallback = env_rate()
     source = make_rate_source(fallback=fallback)
-    initial = await asyncio.to_thread(source)
+    try:
+        initial = await asyncio.wait_for(asyncio.to_thread(source), READ_TIMEOUT_S)
+    except asyncio.TimeoutError:
+        initial = fallback
     log("start", rate_per_min=initial)
     await run(
         client,
