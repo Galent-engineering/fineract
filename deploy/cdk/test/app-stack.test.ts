@@ -216,3 +216,112 @@ describe('AppStack', () => {
     });
   });
 });
+
+describe('AppStack demo scenarios (FIS)', () => {
+  const t = synth();
+  const templates = () => Object.values(t.findResources('AWS::FIS::ExperimentTemplate'));
+  const byScenario = (name: string) => {
+    const r = templates().find((x) => x.Properties.Tags['harness-scenario'] === name);
+    if (!r) throw new Error(`no template ${name}`);
+    return r.Properties;
+  };
+  const acts = (a: unknown): string[] => ([] as string[]).concat(a as string | string[]);
+
+  test('exactly three templates, tagged harness-scenario', () => {
+    const names = templates().map((x) => x.Properties.Tags['harness-scenario']).sort();
+    expect(names).toEqual(['crash', 'db-outage', 'slowdown']);
+  });
+
+  test('db-outage: egress tcp 5432 blackhole for PT4M via the ECS fault endpoints', () => {
+    const a = Object.values(byScenario('db-outage').Actions)[0] as any;
+    expect(a.ActionId).toBe('aws:ecs:task-network-blackhole-port');
+    expect(a.Parameters).toEqual({
+      duration: 'PT4M', port: '5432', protocol: 'tcp', trafficType: 'egress', useEcsFaultInjectionEndpoints: 'true',
+    });
+  });
+
+  test('slowdown: 1500 ms latency for PT4M via the ECS fault endpoints', () => {
+    const a = Object.values(byScenario('slowdown').Actions)[0] as any;
+    expect(a.ActionId).toBe('aws:ecs:task-network-latency');
+    expect(a.Parameters).toEqual({ duration: 'PT4M', delayMilliseconds: '1500', useEcsFaultInjectionEndpoints: 'true' });
+  });
+
+  test('crash: stop-task only', () => {
+    const a = Object.values(byScenario('crash').Actions)[0] as any;
+    expect(a.ActionId).toBe('aws:ecs:stop-task');
+  });
+
+  test('every template targets only the Fineract service in the harness cluster; hard duration is the stop', () => {
+    for (const r of templates()) {
+      const targets = Object.values(r.Properties.Targets) as any[];
+      expect(targets).toHaveLength(1);
+      expect(targets[0].ResourceType).toBe('aws:ecs:task');
+      expect(targets[0].Parameters).toEqual({ cluster: 'harness', service: 'fineract' });
+      expect(r.Properties.StopConditions).toEqual([{ Source: 'none' }]);
+    }
+  });
+
+  test('FIS role: trusted by fis in this account; no wildcard actions; * resources only where AWS has no scoping', () => {
+    const roles = Object.values(t.findResources('AWS::IAM::Role')).filter(
+      (r) => r.Properties.RoleName === 'harness-fis-scenarios',
+    );
+    expect(roles).toHaveLength(1);
+    const trust = roles[0].Properties.AssumeRolePolicyDocument.Statement[0];
+    expect(trust.Principal.Service).toBe('fis.amazonaws.com');
+    expect(trust.Condition.StringEquals['aws:SourceAccount']).toBeDefined();
+    const pol = Object.values(t.findResources('AWS::IAM::Policy')).find((p) =>
+      JSON.stringify(p.Properties.Roles).includes('FisScenarioRole'),
+    );
+    const stmts = pol!.Properties.PolicyDocument.Statement as any[];
+    for (const s of stmts) {
+      for (const act of acts(s.Action)) expect(act).not.toContain('*');
+      if (JSON.stringify(s.Resource) === '"*"') {
+        expect(acts(s.Action).sort()).toEqual(['ssm:CancelCommand', 'ssm:ListCommands', 'tag:GetResources']);
+      }
+    }
+    const send = stmts.find((s) => acts(s.Action).includes('ssm:SendCommand'));
+    const sendRes = JSON.stringify(send.Resource);
+    expect(sendRes).toContain('AWSFIS-Run-Network-Blackhole-Port-ECS');
+    expect(sendRes).toContain('AWSFIS-Run-Network-Latency-ECS');
+    expect(sendRes).toContain('managed-instance/*');
+  });
+
+  test('Fineract task def: fault injection on, pidMode task, SSM agent sidecar with the managed instance role', () => {
+    const d = byFamilyPrefix(t, 'harness-fineract').Properties;
+    expect(d.EnableFaultInjection).toBe(true);
+    expect(d.PidMode).toBe('task');
+    const c = d.ContainerDefinitions.find((x: any) => x.Name === 'amazon-ssm-agent');
+    expect(c.Essential).toBe(false);
+    expect(c.Image).toContain('amazon-ssm-agent');
+    expect(c.Environment[0].Name).toBe('MANAGED_INSTANCE_ROLE_NAME');
+    expect(c.Command[0]).toContain('amazon-ssm-agent -register');
+  });
+
+  test('only the Fineract task def has fault injection', () => {
+    expect(taskDefs(t).filter((r) => r.Properties.EnableFaultInjection === true)).toHaveLength(1);
+  });
+
+  test('SSM managed instance role trusts ssm and carries AmazonSSMManagedInstanceCore', () => {
+    t.hasResourceProperties('AWS::IAM::Role', {
+      AssumeRolePolicyDocument: { Statement: [Match.objectLike({ Principal: { Service: 'ssm.amazonaws.com' } })], Version: '2012-10-17' },
+      ManagedPolicyArns: [Match.objectLike({ 'Fn::Join': ['', Match.arrayWith([':iam::aws:policy/AmazonSSMManagedInstanceCore'])] })],
+    });
+  });
+
+  test('traffic rate parameter exists (default 6); only the traffic role reads it, only that parameter', () => {
+    t.hasResourceProperties('AWS::SSM::Parameter', { Name: '/harness/traffic/rate_per_min', Value: '6', Type: 'String' });
+    const readers = Object.values(t.findResources('AWS::IAM::Policy')).filter((p) =>
+      (p.Properties.PolicyDocument.Statement as any[]).some((s) => acts(s.Action).includes('ssm:GetParameter')),
+    );
+    expect(readers).toHaveLength(1);
+    expect(JSON.stringify(readers[0].Properties.Roles)).toContain('TrafficTaskDefTaskRole');
+    const st = (readers[0].Properties.PolicyDocument.Statement as any[]).find((s) => acts(s.Action).includes('ssm:GetParameter'));
+    expect(st.Action).toBe('ssm:GetParameter');
+    expect(JSON.stringify(st.Resource)).toContain('TrafficRateParam');
+  });
+
+  test('traffic container is told the parameter name', () => {
+    const env = byFamilyPrefix(t, 'harness-traffic').Properties.ContainerDefinitions[0].Environment;
+    expect(env).toContainEqual({ Name: 'RATE_PARAM_NAME', Value: '/harness/traffic/rate_per_min' });
+  });
+});

@@ -8,6 +8,8 @@ import * as targets from 'aws-cdk-lib/aws-route53-targets';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as aps from 'aws-cdk-lib/aws-aps';
+import * as fis from 'aws-cdk-lib/aws-fis';
+import * as ssm from 'aws-cdk-lib/aws-ssm';
 import * as sd from 'aws-cdk-lib/aws-servicediscovery';
 import * as fs from 'fs';
 import * as path from 'path';
@@ -45,6 +47,33 @@ export const ADOT_JAVA_AGENT_IMAGE = 'public.ecr.aws/aws-observability/adot-auto
 /** Cloud Map name of the Fineract service inside the VPC (namespace harness.local). */
 const FINERACT_DNS_LABEL = 'fineract';
 const FINERACT_DNS_NAME = `${FINERACT_DNS_LABEL}.harness.local`;
+/**
+ * FIS ECS task actions need an SSM-agent sidecar that registers the task as an SSM managed instance
+ * (https://docs.aws.amazon.com/fis/latest/userguide/ecs-task-actions.html). Image and script are the documented ones, verbatim.
+ */
+export const SSM_AGENT_IMAGE = 'public.ecr.aws/amazon-ssm-agent/amazon-ssm-agent:latest';
+export const FIS_SCENARIO_DURATION = 'PT4M';
+export const TRAFFIC_RATE_PARAM = '/harness/traffic/rate_per_min';
+/** Port the Fineract task is blackholed on for the db-outage scenario. */
+const POSTGRES_PORT = '5432';
+const SSM_AGENT_SCRIPT = [
+  'set -e; dnf upgrade -y; dnf install jq procps awscli -y;',
+  'term_handler() { echo "Deleting SSM activation $ACTIVATION_ID"; if ! aws ssm delete-activation --activation-id $ACTIVATION_ID --region $ECS_TASK_REGION; then echo "SSM activation $ACTIVATION_ID failed to be deleted" 1>&2; fi;',
+  'MANAGED_INSTANCE_ID=$(jq -e -r .ManagedInstanceID /var/lib/amazon/ssm/registration); echo "Deregistering SSM Managed Instance $MANAGED_INSTANCE_ID";',
+  'if ! aws ssm deregister-managed-instance --instance-id $MANAGED_INSTANCE_ID --region $ECS_TASK_REGION; then echo "SSM Managed Instance $MANAGED_INSTANCE_ID failed to be deregistered" 1>&2; fi; kill -SIGTERM $SSM_AGENT_PID; };',
+  'trap term_handler SIGTERM SIGINT;',
+  'if [[ -z $MANAGED_INSTANCE_ROLE_NAME ]]; then echo "Environment variable MANAGED_INSTANCE_ROLE_NAME not set, exiting" 1>&2; exit 1; fi;',
+  'if ! ps ax | grep amazon-ssm-agent | grep -v grep > /dev/null; then if [[ -n $ECS_CONTAINER_METADATA_URI_V4 ]] ; then echo "Found ECS Container Metadata, running activation with metadata";',
+  'TASK_METADATA=$(curl "${ECS_CONTAINER_METADATA_URI_V4}/task"); ECS_TASK_AVAILABILITY_ZONE=$(echo $TASK_METADATA | jq -e -r \'.AvailabilityZone\'); ECS_TASK_ARN=$(echo $TASK_METADATA | jq -e -r \'.TaskARN\'); ECS_TASK_REGION=$(echo $ECS_TASK_AVAILABILITY_ZONE | sed \'s/.$//\');',
+  "ECS_TASK_AVAILABILITY_ZONE_REGEX='^(af|ap|ca|cn|eu|me|sa|us|us-gov)-(central|north|(north(east|west))|south|south(east|west)|east|west)-[0-9]{1}[a-z]{1}$';",
+  'if ! [[ $ECS_TASK_AVAILABILITY_ZONE =~ $ECS_TASK_AVAILABILITY_ZONE_REGEX ]]; then echo "Error extracting Availability Zone from ECS Container Metadata, exiting" 1>&2; exit 1; fi;',
+  "ECS_TASK_ARN_REGEX='^arn:(aws|aws-cn|aws-us-gov):ecs:[a-z0-9-]+:[0-9]{12}:task/[a-zA-Z0-9_-]+/[a-zA-Z0-9]+$';",
+  'if ! [[ $ECS_TASK_ARN =~ $ECS_TASK_ARN_REGEX ]]; then echo "Error extracting Task ARN from ECS Container Metadata, exiting" 1>&2; exit 1; fi;',
+  'CREATE_ACTIVATION_OUTPUT=$(aws ssm create-activation --iam-role $MANAGED_INSTANCE_ROLE_NAME --tags Key=ECS_TASK_AVAILABILITY_ZONE,Value=$ECS_TASK_AVAILABILITY_ZONE Key=ECS_TASK_ARN,Value=$ECS_TASK_ARN Key=FAULT_INJECTION_SIDECAR,Value=true --region $ECS_TASK_REGION);',
+  'ACTIVATION_CODE=$(echo $CREATE_ACTIVATION_OUTPUT | jq -e -r .ActivationCode); ACTIVATION_ID=$(echo $CREATE_ACTIVATION_OUTPUT | jq -e -r .ActivationId);',
+  'if ! amazon-ssm-agent -register -code $ACTIVATION_CODE -id $ACTIVATION_ID -region $ECS_TASK_REGION; then echo "Failed to register with AWS Systems Manager (SSM), exiting" 1>&2; exit 1; fi;',
+  'amazon-ssm-agent & SSM_AGENT_PID=$!; wait $SSM_AGENT_PID; else echo "ECS Container Metadata not found, exiting" 1>&2; exit 1; fi; else echo "SSM agent is already running, exiting" 1>&2; exit 1; fi',
+].join(' ');
 const SIDECAR_CONFIG_WRITER_IMAGE = 'busybox:1.37.0';
 const readConfig = (file: string): string => fs.readFileSync(path.join(__dirname, '..', 'config', file), 'utf8');
 
@@ -173,6 +202,10 @@ export class AppStack extends cdk.Stack {
       family: 'harness-fineract',
       cpu: 2048,
       memoryLimitMiB: 8192,
+      // FIS aws:ecs:task network actions on Fargate: fault injection endpoints on, one PID namespace for the task
+      // (https://docs.aws.amazon.com/fis/latest/userguide/ecs-task-actions.html).
+      enableFaultInjection: true,
+      pidMode: ecs.PidMode.TASK,
       runtimePlatform: { cpuArchitecture: ecs.CpuArchitecture.X86_64, operatingSystemFamily: ecs.OperatingSystemFamily.LINUX },
     });
     this.ampWorkspace = new aps.CfnWorkspace(this, 'AmpWorkspace', { alias: 'harness' });
@@ -235,6 +268,33 @@ export class AppStack extends cdk.Stack {
 
     fineractContainer.addMountPoints({ containerPath: '/otel', sourceVolume: 'otel', readOnly: true });
     fineractContainer.addContainerDependencies({ container: otelInit, condition: ecs.ContainerDependencyCondition.SUCCESS });
+
+    // FIS sidecar: registers this task as an SSM managed instance (tags ECS_TASK_ARN) so FIS can run its SSM documents in it.
+    const ssmManagedInstanceRole = new iam.Role(this, 'FisSsmManagedInstanceRole', {
+      assumedBy: new iam.ServicePrincipal('ssm.amazonaws.com'),
+      managedPolicies: [iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonSSMManagedInstanceCore')],
+    });
+    ssmManagedInstanceRole.addToPolicy(
+      new iam.PolicyStatement({ actions: ['ssm:DeleteActivation', 'ssm:DeregisterManagedInstance'], resources: ['*'] }),
+    );
+    taskDef.taskRole.addToPrincipalPolicy(
+      new iam.PolicyStatement({ actions: ['ssm:CreateActivation', 'ssm:AddTagsToResource'], resources: ['*'] }),
+    );
+    taskDef.taskRole.addToPrincipalPolicy(
+      new iam.PolicyStatement({
+        actions: ['iam:PassRole'],
+        resources: [ssmManagedInstanceRole.roleArn],
+        conditions: { StringEquals: { 'iam:PassedToService': 'ssm.amazonaws.com' } },
+      }),
+    );
+    taskDef.addContainer('amazon-ssm-agent', {
+      image: ecs.ContainerImage.fromRegistry(SSM_AGENT_IMAGE),
+      essential: false,
+      entryPoint: ['/bin/bash', '-c'],
+      command: [SSM_AGENT_SCRIPT],
+      environment: { MANAGED_INSTANCE_ROLE_NAME: ssmManagedInstanceRole.roleName },
+      logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'ssm-agent', logRetention: logs.RetentionDays.ONE_WEEK }),
+    });
 
     // ADOT: scrapes Prometheus -> AMP (SigV4); OTLP :4318 -> X-Ray + Tempo.
     taskDef.addContainer('adot', {
@@ -338,12 +398,22 @@ export class AppStack extends cdk.Stack {
         FINERACT_BASE_URL: internalFineractUrl,
         SECRET_ARN: this.fineractAdminSecret.secretArn,
         RATE_PER_MIN: '6',
+        RATE_PARAM_NAME: TRAFFIC_RATE_PARAM,
         ERROR_RATE: '0.02',
         SLOW_RATE: '0.01',
       },
       logging: ecs.LogDrivers.awsLogs({ streamPrefix: 'traffic', logRetention: logs.RetentionDays.TWO_WEEKS }),
     });
     this.fineractAdminSecret.grantRead(trafficTaskDef.taskRole);
+    // Journey rate, switchable at runtime (deploy/scripts/demo.sh on|off). The traffic task reads it about once a minute.
+    const rateParam = new ssm.StringParameter(this, 'TrafficRateParam', {
+      parameterName: TRAFFIC_RATE_PARAM,
+      stringValue: '6',
+      description: 'Traffic generator journeys per minute (1..120); RATE_PER_MIN is the fallback',
+    });
+    trafficTaskDef.taskRole.addToPrincipalPolicy(
+      new iam.PolicyStatement({ actions: ['ssm:GetParameter'], resources: [rateParam.parameterArn] }),
+    );
     this.trafficService = new ecs.FargateService(this, 'TrafficService', {
       serviceName: 'traffic',
       cluster: this.cluster,
@@ -510,6 +580,69 @@ export class AppStack extends cdk.Stack {
       conditions: [elbv2.ListenerCondition.pathPatterns([`${FINERACT_CONTEXT}/*`])],
       action: elbv2.ListenerAction.forward([tg]),
     });
+
+    // ---- Demo scenarios (AWS FIS). Templates only: nothing runs until deploy/scripts/demo.sh starts one. ----
+    // Each action has a hard duration, so every scenario reverts on its own; no stop-condition alarm by design.
+    const fisRole = new iam.Role(this, 'FisScenarioRole', {
+      roleName: 'harness-fis-scenarios',
+      assumedBy: new iam.PrincipalWithConditions(new iam.ServicePrincipal('fis.amazonaws.com'), {
+        StringEquals: { 'aws:SourceAccount': this.account },
+        ArnLike: { 'aws:SourceArn': `arn:${this.partition}:fis:${this.region}:${this.account}:experiment/*` },
+      }),
+    });
+    const ecsArn = (rest: string) => `arn:${this.partition}:ecs:${this.region}:${this.account}:${rest}`;
+    const ssmDoc = (name: string) => `arn:${this.partition}:ssm:${this.region}::document/${name}`;
+    fisRole.addToPolicy(new iam.PolicyStatement({
+      actions: ['ecs:DescribeTasks', 'ecs:StopTask'],
+      resources: [ecsArn('task/harness/*')],
+    }));
+    fisRole.addToPolicy(new iam.PolicyStatement({ actions: ['ecs:ListTasks'], resources: [ecsArn('cluster/harness')] }));
+    // SendCommand: only the two FIS network documents, only on managed instances (the registered Fineract task).
+    fisRole.addToPolicy(new iam.PolicyStatement({
+      actions: ['ssm:SendCommand'],
+      resources: [
+        ssmDoc('AWSFIS-Run-Network-Blackhole-Port-ECS'),
+        ssmDoc('AWSFIS-Run-Network-Latency-ECS'),
+        `arn:${this.partition}:ssm:${this.region}:${this.account}:managed-instance/*`,
+      ],
+    }));
+    // These two (and tag lookup for target resolution) have no resource-level scoping.
+    fisRole.addToPolicy(new iam.PolicyStatement({
+      actions: ['ssm:ListCommands', 'ssm:CancelCommand', 'tag:GetResources'],
+      resources: ['*'],
+    }));
+
+    const scenario = (
+      id: string,
+      name: string,
+      description: string,
+      actionId: string,
+      parameters: Record<string, string>,
+    ) =>
+      new fis.CfnExperimentTemplate(this, id, {
+        description,
+        roleArn: fisRole.roleArn,
+        stopConditions: [{ source: 'none' }],
+        tags: { Name: `harness-${name}`, 'harness-scenario': name },
+        targets: {
+          fineractTasks: {
+            resourceType: 'aws:ecs:task',
+            selectionMode: 'ALL',
+            parameters: { cluster: 'harness', service: 'fineract' },
+          },
+        },
+        actions: {
+          [name.replace(/-/g, '')]: { actionId, parameters: Object.keys(parameters).length ? parameters : undefined, targets: { Tasks: 'fineractTasks' } },
+        },
+      });
+    scenario('ScenarioDbOutage', 'db-outage', 'Fineract task cannot reach Postgres (egress tcp 5432) for 4 minutes',
+      'aws:ecs:task-network-blackhole-port',
+      { duration: FIS_SCENARIO_DURATION, port: POSTGRES_PORT, protocol: 'tcp', trafficType: 'egress', useEcsFaultInjectionEndpoints: 'true' });
+    scenario('ScenarioSlowdown', 'slowdown', 'About 1500 ms added network latency on the Fineract task for 4 minutes',
+      'aws:ecs:task-network-latency',
+      { duration: FIS_SCENARIO_DURATION, delayMilliseconds: '1500', useEcsFaultInjectionEndpoints: 'true' });
+    scenario('ScenarioCrash', 'crash', 'Stop the running Fineract task; the ECS service replaces it',
+      'aws:ecs:stop-task', {});
 
     new route53.ARecord(this, 'DomainAlias', {
       zone: props.dns.zone,

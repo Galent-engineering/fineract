@@ -22,6 +22,7 @@ from .journeys import (
     run_repayment,
     run_savings_journey,
 )
+from .rate import REFRESH_S, env_rate, make_rate_source
 from .seed import SeedResult, seed
 
 MAX_CONSECUTIVE_FAILURES = 5
@@ -45,17 +46,26 @@ async def run(
     error_rate: float = 0.02,
     slow_rate: float = 0.01,
     max_ticks: int | None = None,
+    rate_source: Callable[[], float] | None = None,
+    rate_refresh_s: float = REFRESH_S,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     rng: random.Random | None = None,
 ) -> None:
     rng = rng or random.Random()
     interval = 60.0 / rate_per_min
+    last_refresh = time.monotonic()
     loans: deque[int] = deque(maxlen=500)
     failures = 0
     tick = 0
     while max_ticks is None or tick < max_ticks:
         tick += 1
         started = time.monotonic()
+        if rate_source is not None and started - last_refresh >= rate_refresh_s:
+            last_refresh = started
+            new_rate = await asyncio.to_thread(rate_source)  # blocking boto3 call stays off the event loop
+            if new_rate != rate_per_min:
+                log("rate_change", old=rate_per_min, new=new_rate)
+                rate_per_min, interval = new_rate, 60.0 / new_rate
         outcomes: list[JourneyOutcome] = []
         if rng.random() < error_rate:
             outcomes.append(await _guard("inject_error", lambda: inject_error(client)))  # expected 4xx: logged, not counted
@@ -123,11 +133,15 @@ async def main_async() -> None:
     username, password = _credentials(os.environ["SECRET_ARN"])
     client = FineractClient(base, username, password)
     seed_result = await startup_seed(client)
-    log("start", rate_per_min=os.environ.get("RATE_PER_MIN", "6"))
+    fallback = env_rate()
+    source = make_rate_source(fallback=fallback)
+    initial = await asyncio.to_thread(source)
+    log("start", rate_per_min=initial)
     await run(
         client,
         seed_result,
-        rate_per_min=float(os.environ.get("RATE_PER_MIN", "6")),
+        rate_per_min=initial,
+        rate_source=source,
         error_rate=float(os.environ.get("ERROR_RATE", "0.02")),
         slow_rate=float(os.environ.get("SLOW_RATE", "0.01")),
     )
