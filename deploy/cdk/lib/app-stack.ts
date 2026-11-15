@@ -626,13 +626,9 @@ export class AppStack extends cdk.Stack {
       actions: ['ecs:DescribeTasks', 'ecs:StopTask'],
       resources: [ecsArn('task/harness/*')],
     }));
-    // ListTasks authorizes on container-instance (none on Fargate), not on the cluster ARN, so `*` plus the ecs:cluster key
-    // (https://docs.aws.amazon.com/service-authorization/latest/reference/list_ecs.html). Read-only.
-    fisRole.addToPolicy(new iam.PolicyStatement({
-      actions: ['ecs:ListTasks'],
-      resources: ['*'],
-      conditions: { ArnEquals: { 'ecs:cluster': ecsArn('cluster/harness') } },
-    }));
+    // ListTasks authorizes on container-instance (none on Fargate), not on the cluster ARN. Live: with an ecs:cluster
+    // condition, FIS target resolution failed (InvalidTarget) — the key is not in its request context. Read-only, so `*`.
+    fisRole.addToPolicy(new iam.PolicyStatement({ actions: ['ecs:ListTasks'], resources: ['*'] }));
     // SendCommand: only the two FIS network documents, and only on instances registered by the Fineract sidecar.
     fisRole.addToPolicy(new iam.PolicyStatement({
       actions: ['ssm:SendCommand'],

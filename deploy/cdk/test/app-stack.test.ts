@@ -288,7 +288,7 @@ describe('AppStack demo scenarios (FIS)', () => {
     }
     const list = stmts.find((s) => acts(s.Action).includes('ecs:ListTasks'));
     expect(list.Resource).toBe('*');
-    expect(list.Condition.ArnEquals['ecs:cluster']).toBeDefined();
+    expect(list.Condition).toBeUndefined(); // FIS target resolution has no ecs:cluster in its context (live InvalidTarget)
     const sends = stmts.filter((s) => acts(s.Action).includes('ssm:SendCommand'));
     const docs = sends.find((s) => JSON.stringify(s.Resource).includes('document/'));
     expect(JSON.stringify(docs.Resource)).toContain('AWSFIS-Run-Network-Blackhole-Port-ECS');
