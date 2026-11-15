@@ -133,7 +133,7 @@ case "$CMD" in
         echo "look for:    Fineract still answers HTTP but API calls return 5xx (database unreachable); traffic journeys start failing." ;;
       slowdown)
         echo "expected end: $(fmt $((started + SCENARIO_MIN * 60))) (hard duration ${SCENARIO_MIN} min, reverts on its own)"
-        echo "look for:    about 200 ms added per database round trip; requests still succeed but slow down." ;;
+        echo "look for:    about 20 ms added per database round trip (typical requests go from ~0.15 s to ~1-1.5 s); requests still succeed." ;;
       crash)
         echo "expected end: immediate; ECS then replaces the task (about 7-10 min until Fineract is healthy again)"
         echo "look for:    the Fineract task stops, requests fail until the replacement is up." ;;

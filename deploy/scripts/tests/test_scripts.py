@@ -317,4 +317,4 @@ def test_demo_tolerates_two_failed_polls_but_not_three(env):
 
 def test_demo_slowdown_hint_matches_the_readme(env):
     p, st = env("demo.sh", "slowdown", exp_seq=["completed"])
-    assert "about 200 ms added per database round trip" in p.stdout
+    assert "about 20 ms added per database round trip" in p.stdout

@@ -696,9 +696,9 @@ export class AppStack extends cdk.Stack {
     scenario('ScenarioDbOutage', 'db-outage', 'Fineract task cannot reach Postgres (egress tcp 5432) for 4 minutes',
       'aws:ecs:task-network-blackhole-port',
       { duration: FIS_SCENARIO_DURATION, port: POSTGRES_PORT, protocol: 'tcp', trafficType: 'egress', useEcsFaultInjectionEndpoints: 'true' });
-    scenario('ScenarioSlowdown', 'slowdown', 'About 200 ms added to every outgoing packet of the Fineract task (database calls included) for 4 minutes',
+    scenario('ScenarioSlowdown', 'slowdown', 'About 20 ms added to every outgoing packet of the Fineract task (database calls included) for 4 minutes',
       'aws:ecs:task-network-latency',
-      { duration: FIS_SCENARIO_DURATION, delayMilliseconds: '200', useEcsFaultInjectionEndpoints: 'true' });
+      { duration: FIS_SCENARIO_DURATION, delayMilliseconds: '20', useEcsFaultInjectionEndpoints: 'true' });
     scenario('ScenarioCrash', 'crash', 'Stop the running Fineract task; the ECS service replaces it',
       'aws:ecs:stop-task', {});
 
