@@ -47,7 +47,14 @@ if svc == "ssm" and op == "delete-parameter":
     st["ssm"].pop(opt("--name"), None)
     out()
 if svc == "ecs" and op == "describe-services":
-    out(st["counts"][opt("--cluster") + ":" + opt("--services")])
+    key = opt("--cluster") + ":" + opt("--services")
+    if "runningCount" in (opt("--query") or ""):
+        seq = st.get("running_seq")  # optional scripted running counts, one per call; the last one repeats
+        if seq:
+            st["running_calls"] = st.get("running_calls", 0) + 1
+            out(seq[min(st["running_calls"], len(seq)) - 1])
+        out(st["counts"][key])
+    out(st["counts"][key])
 if svc == "ecs" and op == "update-service":
     key = opt("--cluster") + ":" + opt("--service")
     if st.get("fail_update_after") is not None:
@@ -75,6 +82,27 @@ if svc == "rds" and op == "start-db-instance":
     out()
 if svc == "rds" and op == "wait":
     out()
+if svc == "fis":
+    if op == "list-experiment-templates":
+        tpl = st.get("templates") or {"db-outage": "EXT-DB", "slowdown": "EXT-SLOW", "crash": "EXT-CRASH"}
+        out(json.dumps({"experimentTemplates": [{"id": i, "tags": {"harness-scenario": n}} for n, i in tpl.items()]
+                        + [{"id": "EXT-OTHER", "tags": {"Name": "rds-reboot"}}]}))
+    if op == "list-experiments":
+        out(json.dumps({"experiments": st.get("experiments", [])}))
+    if op == "start-experiment":
+        if st.get("fail_start"):
+            fail("An error occurred (ValidationException) when calling the StartExperiment operation")
+        st["started"] = {"template": opt("--experiment-template-id"), "tags": opt("--tags")}
+        out(json.dumps({"experiment": {"id": "EXP-NEW", "startTime": "2026-11-15T10:00:00+00:00"}}))
+    if op == "get-experiment":
+        if "reason" in (opt("--query") or ""):
+            out("Experiment completed")
+        seq = st.get("exp_seq") or ["running", "completed"]
+        st["exp_calls"] = st.get("exp_calls", 0) + 1
+        out(seq[min(st["exp_calls"], len(seq)) - 1])
+    if op == "stop-experiment":
+        st.setdefault("stopped", []).append(opt("--id"))
+        out("{}")
 if svc == "sleep":
     out()
 if svc == "secretsmanager":

@@ -25,11 +25,11 @@ def env(tmp_path):
     state = tmp_path / "state.json"
     e = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "FAKE_STATE": str(state)}
 
-    def run(script, **st):
+    def run(script, *args, **st):
         base = {"ssm": {}, "ssm_errors": {}, "counts": {k: 1 for k in SVC}, "rds": "available"}
         base.update(st)
         state.write_text(json.dumps(base))
-        p = subprocess.run(["bash", str(SCRIPTS / script)], env=e, capture_output=True, text=True, timeout=60)
+        p = subprocess.run(["bash", str(SCRIPTS / script), *args], env=e, capture_output=True, text=True, timeout=60)
         return p, json.loads(state.read_text())
 
     return run
@@ -157,3 +157,124 @@ def test_pause_ssm_read_error_other_than_not_found_aborts_without_touching_anyth
     assert "ThrottlingException" in p.stderr
     assert "/harness/desired-counts" not in st["ssm"]
     assert all(v == 1 for v in st["counts"].values())
+
+
+# ---- demo.sh ----------------------------------------------------------------------------------------------------------
+
+def live(status="running", tpl="EXT-DB", start="2026-11-15T10:00:00+00:00", id_="EXP-OLD"):
+    return {"id": id_, "experimentTemplateId": tpl, "state": {"status": status}, "startTime": start}
+
+
+def test_demo_on_and_off_set_the_rate_and_print_before_after(env):
+    p, st = env("demo.sh", "on", ssm={"/harness/traffic/rate_per_min": "6"})
+    assert p.returncode == 0, p.stderr
+    assert st["ssm"]["/harness/traffic/rate_per_min"] == "60"
+    assert "6 -> 60" in p.stdout
+    p, st = env("demo.sh", "off", ssm={"/harness/traffic/rate_per_min": "60"})
+    assert st["ssm"]["/harness/traffic/rate_per_min"] == "6"
+    assert "60 -> 6" in p.stdout
+
+
+def test_demo_rejects_unknown_commands_and_missing_command(env):
+    assert env("demo.sh")[0].returncode == 2
+    assert env("demo.sh", "explode")[0].returncode == 2
+
+
+def test_demo_db_outage_starts_the_tagged_template_and_waits_for_the_end(env):
+    p, st = env("demo.sh", "db-outage", exp_seq=["running", "running", "completed"])
+    assert p.returncode == 0, p.stderr
+    assert st["started"]["template"] == "EXT-DB"
+    assert st["started"]["tags"] == "harness-scenario=db-outage"
+    assert "EXP-NEW" in p.stdout and "expected end" in p.stdout and "5xx" in p.stdout
+    assert "completed" in p.stdout.splitlines()[-1]
+
+
+def test_demo_picks_the_template_by_scenario_tag(env):
+    for name, tid in [("slowdown", "EXT-SLOW"), ("crash", "EXT-CRASH")]:
+        p, st = env("demo.sh", name, exp_seq=["completed"])
+        assert p.returncode == 0, p.stderr
+        assert st["started"]["template"] == tid
+
+
+def test_demo_refuses_when_paused(env):
+    p, st = env("demo.sh", "db-outage", counts={k: 0 for k in SVC})
+    assert p.returncode == 1
+    assert "paused" in p.stderr
+    assert "started" not in st
+
+
+def test_demo_refuses_while_another_scenario_runs(env):
+    p, st = env("demo.sh", "slowdown", experiments=[live("running")])
+    assert p.returncode == 1
+    assert "already running" in p.stderr and "EXP-OLD" in p.stderr
+    assert "started" not in st
+
+
+def test_demo_finished_experiments_do_not_block_a_new_one(env):
+    p, st = env("demo.sh", "slowdown", experiments=[live("completed")], exp_seq=["completed"])
+    assert p.returncode == 0, p.stderr
+
+
+def test_demo_a_foreign_experiment_does_not_block(env):
+    p, st = env("demo.sh", "slowdown", experiments=[live("running", tpl="EXT-OTHER")], exp_seq=["completed"])
+    assert p.returncode == 0, p.stderr
+
+
+def test_demo_missing_template_is_a_clear_failure(env):
+    p, st = env("demo.sh", "crash", templates={"slowdown": "EXT-SLOW"})
+    assert p.returncode == 1
+    assert "harness-scenario=crash" in p.stderr
+
+
+def test_demo_wait_for_the_experiment_is_bounded(env):
+    p, st = env("demo.sh", "db-outage", exp_seq=["running"])
+    assert p.returncode == 1
+    assert "still 'running'" in p.stderr
+    assert st["exp_calls"] <= 61
+
+
+def test_demo_failed_experiment_exits_nonzero(env):
+    p, st = env("demo.sh", "slowdown", exp_seq=["failed"])
+    assert p.returncode == 1
+    assert "did not run to completion" in p.stderr
+
+
+def test_demo_crash_waits_for_the_replacement_task(env):
+    p, st = env("demo.sh", "crash", exp_seq=["completed"], running_seq=["1", "0", "0", "1"])
+    assert p.returncode == 0, p.stderr
+    assert "fineract 1 running / 1 desired" in p.stdout
+
+
+def test_demo_final_wait_for_fineract_is_bounded(env):
+    p, st = env("demo.sh", "crash", exp_seq=["completed"], running_seq=["1", "0"])
+    assert p.returncode == 1
+    assert "still 0/1" in p.stderr
+    assert st["running_calls"] <= 62
+
+
+def test_demo_status_shows_rate_counts_and_experiments(env):
+    p, st = env("demo.sh", "status", ssm={"/harness/traffic/rate_per_min": "60"},
+                experiments=[live("running"), live("completed", tpl="EXT-SLOW", start="2026-11-14T10:00:00+00:00", id_="EXP-PREV")])
+    assert p.returncode == 0, p.stderr
+    out = p.stdout
+    assert "traffic rate per minute: 60" in out
+    assert "fineract: 1 running / 1 desired" in out
+    assert "EXP-OLD running" in out and "EXP-PREV completed" in out and "db-outage" in out
+
+
+def test_demo_stop_stops_only_active_scenario_experiments(env):
+    p, st = env("demo.sh", "stop", experiments=[live("running"), live("completed", id_="EXP-DONE"),
+                                               live("running", tpl="EXT-OTHER", id_="EXP-FOREIGN")])
+    assert p.returncode == 0, p.stderr
+    assert st["stopped"] == ["EXP-OLD"]
+
+
+def test_demo_stop_with_nothing_running_is_a_noop(env):
+    p, st = env("demo.sh", "stop")
+    assert p.returncode == 0
+    assert "stopped" not in st
+
+
+def test_demo_accepts_profile_flag(env):
+    p, st = env("demo.sh", "--profile", "other", "status")
+    assert p.returncode == 0, p.stderr

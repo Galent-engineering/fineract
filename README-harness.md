@@ -119,6 +119,33 @@ us-east-1; both idempotent).
 - Lambda tests: `cd deploy/cdk && uv run --with boto3 --with pytest pytest lambda -v`. Script tests (stub `aws`):
   `cd deploy/scripts && uv run --with pytest pytest tests -v`.
 
+## Demo scenarios
+
+Break the harness on purpose, watch monitoring react, and let it recover by itself. One command each, from `deploy/scripts`:
+
+| Command | What it does | Duration |
+| --- | --- | --- |
+| `./demo.sh db-outage` | Fineract cannot reach Postgres (egress tcp 5432 blackholed). It keeps serving HTTP and answers 5xx. | 4 min |
+| `./demo.sh slowdown` | About 1500 ms of network latency on the Fineract task; responses get slow. | 4 min |
+| `./demo.sh crash` | Stops the Fineract task; ECS starts a replacement (about 7-10 min until healthy). | until replaced |
+| `./demo.sh on` / `off` | Traffic rate 60 / 6 journeys per minute (SSM `/harness/traffic/rate_per_min`, read by the traffic task about once a minute, bounds 1..120). Prints the before and after value. | until changed |
+| `./demo.sh status` | Active and recent scenario experiments, traffic rate, Fineract running count. | |
+| `./demo.sh stop` | Ends a running scenario early. | |
+
+- Each scenario is an AWS FIS experiment template in `HarnessApp` (tag `harness-scenario=<name>`), targeting only the `fineract`
+  service in cluster `harness`. The 4-minute limit is the action's own duration, so every scenario reverts on its own;
+  there is no stop-condition alarm. `demo.sh` refuses to start while the harness is paused or another scenario is running,
+  and waits (bounded) for the experiment to end and Fineract to be back at its desired count.
+- Fault injection needs the Fineract task definition to run with `enableFaultInjection`, `pidMode: task` and an SSM-agent
+  sidecar (`amazon-ssm-agent`) that registers the task as an SSM managed instance (per the AWS FIS ECS task actions
+  documentation). The sidecar runs `dnf upgrade` at start, which needs outbound internet (the tasks have public IPs).
+  Turning this on rolls the Fineract task once.
+- Slowdown delays all egress of the Fineract task, database calls included, so every query pays the delay.
+- Cost: AWS FIS bills $0.10 per action-minute (one account, us-east-1; see https://aws.amazon.com/fis/pricing/), so a 4-minute
+  scenario is about $0.40 and `crash` under $0.10. Nothing is billed while no experiment runs.
+- Run these only against this harness. The FIS role is scoped to cluster `harness`, but never point `--profile` at another
+  account or reuse the templates for anything else.
+
 ## Estimated monthly cost
 
 us-east-1 list prices (AWS Price List API, Nov 2026), 730 h/month, no savings plans. Estimates, not bills.
