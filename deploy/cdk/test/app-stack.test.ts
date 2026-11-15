@@ -240,10 +240,10 @@ describe('AppStack demo scenarios (FIS)', () => {
     });
   });
 
-  test('slowdown: 1500 ms latency for PT4M via the ECS fault endpoints', () => {
+  test('slowdown: 200 ms latency for PT4M via the ECS fault endpoints', () => {
     const a = Object.values(byScenario('slowdown').Actions)[0] as any;
     expect(a.ActionId).toBe('aws:ecs:task-network-latency');
-    expect(a.Parameters).toEqual({ duration: 'PT4M', delayMilliseconds: '1500', useEcsFaultInjectionEndpoints: 'true' });
+    expect(a.Parameters).toEqual({ duration: 'PT4M', delayMilliseconds: '200', useEcsFaultInjectionEndpoints: 'true' });
   });
 
   test('crash: stop-task only', () => {

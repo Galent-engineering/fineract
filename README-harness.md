@@ -126,7 +126,7 @@ Break the harness on purpose, watch monitoring react, and let it recover by itse
 | Command | What it does | Duration |
 | --- | --- | --- |
 | `./demo.sh db-outage` | Fineract cannot reach Postgres (egress tcp 5432 blackholed). It keeps serving HTTP and answers 5xx. | 4 min |
-| `./demo.sh slowdown` | About 1500 ms of network latency on the Fineract task; responses get slow. | 4 min |
+| `./demo.sh slowdown` | About 200 ms added to every outgoing packet of the Fineract task, database calls included, so a request slows by roughly 200 ms per database round trip. | 4 min |
 | `./demo.sh crash` | Stops the Fineract task; ECS starts a replacement (about 7-10 min until healthy). | until replaced |
 | `./demo.sh on` / `off` | Traffic rate 60 / 6 journeys per minute (SSM `/harness/traffic/rate_per_min`, read by the traffic task about once a minute, bounds 1..120). Prints the before and after value. | until changed |
 | `./demo.sh status` | Active and recent scenario experiments, traffic rate, Fineract running count. | |
