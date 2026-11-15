@@ -274,11 +274,34 @@ export class AppStack extends cdk.Stack {
       assumedBy: new iam.ServicePrincipal('ssm.amazonaws.com'),
       managedPolicies: [iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonSSMManagedInstanceCore')],
     });
-    ssmManagedInstanceRole.addToPolicy(
-      new iam.PolicyStatement({ actions: ['ssm:DeleteActivation', 'ssm:DeregisterManagedInstance'], resources: ['*'] }),
-    );
+    // The documented script tags its activation (and so the registered instance) FAULT_INJECTION_SIDECAR=true.
+    // Deregister is scoped to such instances. DeleteActivation has no resource types or condition keys in the Service
+    // Authorization Reference (https://docs.aws.amazon.com/service-authorization/latest/reference/list_ssm.html), so it stays `*`.
+    // The managed-instance role gets the pair the docs list; the task role gets it too because the sidecar's SIGTERM handler
+    // runs the CLI with the task role credentials (otherwise every task stop leaves a stale instance and activation).
+    const ssmArn = (rest: string) => `arn:${this.partition}:ssm:${this.region}:${this.account}:${rest}`;
+    const sidecarCleanup = () => [
+      new iam.PolicyStatement({
+        actions: ['ssm:DeregisterManagedInstance'],
+        resources: [ssmArn('managed-instance/*')],
+        conditions: { StringEquals: { 'ssm:resourceTag/FAULT_INJECTION_SIDECAR': 'true' } },
+      }),
+      new iam.PolicyStatement({ actions: ['ssm:DeleteActivation'], resources: ['*'] }),
+    ];
+    sidecarCleanup().forEach((st) => ssmManagedInstanceRole.addToPolicy(st));
+    sidecarCleanup().forEach((st) => taskDef.taskRole.addToPrincipalPolicy(st));
+    // CreateActivation cannot be resource-scoped (it creates the resource). Accepted risk: dev account, and the only code in
+    // this task is the allow-listed Fineract app. A compromised container could register its own node (PassRole below limits the
+    // role it can attach to the one managed-instance role) and, by tagging it, receive the FIS network documents meant for the task.
     taskDef.taskRole.addToPrincipalPolicy(
-      new iam.PolicyStatement({ actions: ['ssm:CreateActivation', 'ssm:AddTagsToResource'], resources: ['*'] }),
+      new iam.PolicyStatement({ actions: ['ssm:CreateActivation'], resources: ['*'] }),
+    );
+    // Tags set at activation time and by the agent: managed instances and activations only.
+    taskDef.taskRole.addToPrincipalPolicy(
+      new iam.PolicyStatement({
+        actions: ['ssm:AddTagsToResource'],
+        resources: [ssmArn('managed-instance/*'), ssmArn('activation/*')],
+      }),
     );
     taskDef.taskRole.addToPrincipalPolicy(
       new iam.PolicyStatement({
@@ -592,23 +615,36 @@ export class AppStack extends cdk.Stack {
     });
     const ecsArn = (rest: string) => `arn:${this.partition}:ecs:${this.region}:${this.account}:${rest}`;
     const ssmDoc = (name: string) => `arn:${this.partition}:ssm:${this.region}::document/${name}`;
+    // StopTask authorizes on the task ARN (task/<cluster>/<id>), which carries no service name, so it cannot be limited to
+    // the fineract service; the cluster scope is the narrowest IAM allows. The templates themselves only select fineract.
     fisRole.addToPolicy(new iam.PolicyStatement({
       actions: ['ecs:DescribeTasks', 'ecs:StopTask'],
       resources: [ecsArn('task/harness/*')],
     }));
-    fisRole.addToPolicy(new iam.PolicyStatement({ actions: ['ecs:ListTasks'], resources: [ecsArn('cluster/harness')] }));
-    // SendCommand: only the two FIS network documents, only on managed instances (the registered Fineract task).
+    // ListTasks authorizes on container-instance (none on Fargate), not on the cluster ARN, so `*` plus the ecs:cluster key
+    // (https://docs.aws.amazon.com/service-authorization/latest/reference/list_ecs.html). Read-only.
+    fisRole.addToPolicy(new iam.PolicyStatement({
+      actions: ['ecs:ListTasks'],
+      resources: ['*'],
+      conditions: { ArnEquals: { 'ecs:cluster': ecsArn('cluster/harness') } },
+    }));
+    // SendCommand: only the two FIS network documents, and only on instances registered by the Fineract sidecar.
     fisRole.addToPolicy(new iam.PolicyStatement({
       actions: ['ssm:SendCommand'],
-      resources: [
-        ssmDoc('AWSFIS-Run-Network-Blackhole-Port-ECS'),
-        ssmDoc('AWSFIS-Run-Network-Latency-ECS'),
-        `arn:${this.partition}:ssm:${this.region}:${this.account}:managed-instance/*`,
-      ],
+      resources: [ssmDoc('AWSFIS-Run-Network-Blackhole-Port-ECS'), ssmDoc('AWSFIS-Run-Network-Latency-ECS')],
     }));
-    // These two (and tag lookup for target resolution) have no resource-level scoping.
     fisRole.addToPolicy(new iam.PolicyStatement({
-      actions: ['ssm:ListCommands', 'ssm:CancelCommand', 'tag:GetResources'],
+      actions: ['ssm:SendCommand'],
+      resources: [ssmArn('managed-instance/*')],
+      conditions: { StringEquals: { 'ssm:resourceTag/FAULT_INJECTION_SIDECAR': 'true' } },
+    }));
+    // No resource-level scoping exists for these: command listing/cancel, tag lookup for target resolution, and the
+    // describe calls the FIS actions reference lists for aws:ecs:task-network-latency. All read-only or self-limiting.
+    fisRole.addToPolicy(new iam.PolicyStatement({
+      actions: [
+        'ssm:ListCommands', 'ssm:CancelCommand', 'tag:GetResources',
+        'ecs:DescribeContainerInstances', 'ec2:DescribeInstances', 'ec2:DescribeSubnets',
+      ],
       resources: ['*'],
     }));
 

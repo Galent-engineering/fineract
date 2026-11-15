@@ -276,14 +276,57 @@ describe('AppStack demo scenarios (FIS)', () => {
     for (const s of stmts) {
       for (const act of acts(s.Action)) expect(act).not.toContain('*');
       if (JSON.stringify(s.Resource) === '"*"') {
-        expect(acts(s.Action).sort()).toEqual(['ssm:CancelCommand', 'ssm:ListCommands', 'tag:GetResources']);
+        expect(acts(s.Action).sort()).toEqual([
+          'ec2:DescribeInstances', 'ec2:DescribeSubnets', 'ecs:DescribeContainerInstances', 'ecs:ListTasks',
+          'ssm:CancelCommand', 'ssm:ListCommands', 'tag:GetResources',
+        ].filter((x) => acts(s.Action).includes(x)));
       }
     }
-    const send = stmts.find((s) => acts(s.Action).includes('ssm:SendCommand'));
-    const sendRes = JSON.stringify(send.Resource);
-    expect(sendRes).toContain('AWSFIS-Run-Network-Blackhole-Port-ECS');
-    expect(sendRes).toContain('AWSFIS-Run-Network-Latency-ECS');
-    expect(sendRes).toContain('managed-instance/*');
+    const flat = stmts.flatMap((s) => acts(s.Action));
+    for (const need of ['ecs:DescribeContainerInstances', 'ec2:DescribeInstances', 'ec2:DescribeSubnets']) {
+      expect(flat).toContain(need);
+    }
+    const list = stmts.find((s) => acts(s.Action).includes('ecs:ListTasks'));
+    expect(list.Resource).toBe('*');
+    expect(list.Condition.ArnEquals['ecs:cluster']).toBeDefined();
+    const sends = stmts.filter((s) => acts(s.Action).includes('ssm:SendCommand'));
+    const docs = sends.find((s) => JSON.stringify(s.Resource).includes('document/'));
+    expect(JSON.stringify(docs.Resource)).toContain('AWSFIS-Run-Network-Blackhole-Port-ECS');
+    expect(JSON.stringify(docs.Resource)).toContain('AWSFIS-Run-Network-Latency-ECS');
+    expect(JSON.stringify(docs.Resource)).not.toContain('managed-instance');
+    const inst = sends.find((s) => JSON.stringify(s.Resource).includes('managed-instance/*'));
+    expect(inst.Condition.StringEquals['ssm:resourceTag/FAULT_INJECTION_SIDECAR']).toBe('true');
+    const stop = stmts.find((s) => acts(s.Action).includes('ecs:StopTask'));
+    expect(JSON.stringify(stop.Resource)).toContain('task/harness/*');
+  });
+
+  const policyStatements = (rolePart: string) => {
+    const pols = Object.values(t.findResources('AWS::IAM::Policy')).filter((p) => JSON.stringify(p.Properties.Roles).includes(rolePart));
+    return pols.flatMap((p) => p.Properties.PolicyDocument.Statement as any[]);
+  };
+
+  test('sidecar permissions on the Fineract task role are scoped (deregister by tag, tags on instances/activations, PassRole to one role)', () => {
+    const st = policyStatements('FineractTaskDefTaskRole');
+    const dereg = st.find((s) => acts(s.Action).includes('ssm:DeregisterManagedInstance'));
+    expect(JSON.stringify(dereg.Resource)).toContain('managed-instance/*');
+    expect(dereg.Condition.StringEquals['ssm:resourceTag/FAULT_INJECTION_SIDECAR']).toBe('true');
+    const tag = st.find((s) => acts(s.Action).includes('ssm:AddTagsToResource'));
+    expect(tag.Resource).not.toBe('*');
+    expect(JSON.stringify(tag.Resource)).toContain('managed-instance/*');
+    expect(JSON.stringify(tag.Resource)).toContain('activation/*');
+    expect(st.some((s) => acts(s.Action).includes('ssm:DeleteActivation'))).toBe(true);
+    const create = st.find((s) => acts(s.Action).includes('ssm:CreateActivation'));
+    expect(acts(create.Action)).toEqual(['ssm:CreateActivation']);
+    const pass = st.find((s) => acts(s.Action).includes('iam:PassRole') && JSON.stringify(s.Resource).includes('FisSsmManagedInstanceRole'));
+    expect(pass.Condition.StringEquals['iam:PassedToService']).toBe('ssm.amazonaws.com');
+    expect(Array.isArray(pass.Resource)).toBe(false);
+  });
+
+  test('managed-instance role: deregister scoped by the sidecar tag', () => {
+    const st = policyStatements('FisSsmManagedInstanceRole');
+    const dereg = st.find((s) => acts(s.Action).includes('ssm:DeregisterManagedInstance'));
+    expect(dereg.Condition.StringEquals['ssm:resourceTag/FAULT_INJECTION_SIDECAR']).toBe('true');
+    expect(dereg.Resource).not.toBe('*');
   });
 
   test('Fineract task def: fault injection on, pidMode task, SSM agent sidecar with the managed instance role', () => {
