@@ -311,9 +311,7 @@ describe('AppStack demo scenarios (FIS)', () => {
     expect(JSON.stringify(dereg.Resource)).toContain('managed-instance/*');
     expect(dereg.Condition.StringEquals['ssm:resourceTag/FAULT_INJECTION_SIDECAR']).toBe('true');
     const tag = st.find((s) => acts(s.Action).includes('ssm:AddTagsToResource'));
-    expect(tag.Resource).not.toBe('*');
-    expect(JSON.stringify(tag.Resource)).toContain('managed-instance/*');
-    expect(JSON.stringify(tag.Resource)).toContain('activation/*');
+    expect(tag.Condition.StringEquals['aws:RequestTag/FAULT_INJECTION_SIDECAR']).toBe('true');
     expect(st.some((s) => acts(s.Action).includes('ssm:DeleteActivation'))).toBe(true);
     const create = st.find((s) => acts(s.Action).includes('ssm:CreateActivation'));
     expect(acts(create.Action)).toEqual(['ssm:CreateActivation']);

@@ -296,11 +296,13 @@ export class AppStack extends cdk.Stack {
     taskDef.taskRole.addToPrincipalPolicy(
       new iam.PolicyStatement({ actions: ['ssm:CreateActivation'], resources: ['*'] }),
     );
-    // Tags set at activation time and by the agent: managed instances and activations only.
+    // The only tagging is create-activation's own --tags, which always carries FAULT_INJECTION_SIDECAR=true. The Service
+    // Authorization Reference lists no activation resource type, so scope by the request tag instead of the resource.
     taskDef.taskRole.addToPrincipalPolicy(
       new iam.PolicyStatement({
         actions: ['ssm:AddTagsToResource'],
-        resources: [ssmArn('managed-instance/*'), ssmArn('activation/*')],
+        resources: ['*'],
+        conditions: { StringEquals: { 'aws:RequestTag/FAULT_INJECTION_SIDECAR': 'true' } },
       }),
     );
     taskDef.taskRole.addToPrincipalPolicy(
