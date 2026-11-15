@@ -44,6 +44,7 @@ async def _step(
 ) -> dict[str, Any]:
     t0 = time.monotonic()
     status = 200
+    error: str | None = None
     try:
         if method == "GET":
             resp = await client.get(path, params)
@@ -52,8 +53,11 @@ async def _step(
         return resp
     except FineractError as exc:
         status = exc.status
+        if status == 0:
+            error = str(exc.body.get("error", "error"))[:100]  # "timeout" for a request that hit the client timeout
         raise
     finally:
+        extra = {"error": error} if error else {}
         log(
             "step",
             journey=out.journey,
@@ -61,6 +65,7 @@ async def _step(
             status=status,
             latency_ms=round((time.monotonic() - t0) * 1000),
             injected=out.injected,
+            **extra,
         )
 
 

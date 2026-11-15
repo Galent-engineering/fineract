@@ -31,3 +31,40 @@ async def test_connection_failure_is_status_zero(client):
     with pytest.raises(FineractError) as ei:
         await client.get("/offices")
     assert ei.value.status == 0
+
+
+import asyncio  # noqa: E402
+
+import httpx  # noqa: E402
+import pytest  # noqa: E402
+import respx  # noqa: E402
+
+from harness_traffic.client import FineractClient, FineractError  # noqa: E402
+
+
+@respx.mock
+async def test_a_slow_response_becomes_status_0_timeout():
+    async def hang(request):
+        await asyncio.sleep(1)
+        return httpx.Response(200, json={})
+
+    respx.get("https://f.test/fineract-provider/api/v1/x").mock(side_effect=hang)
+    c = FineractClient("https://f.test", "u", "p", timeout=0.05)
+    with pytest.raises(FineractError) as ei:
+        await c.get("/x")
+    assert ei.value.status == 0 and str(ei.value) == "timeout"
+
+
+@respx.mock
+async def test_httpx_timeout_exceptions_are_also_status_0_timeout():
+    respx.get("https://f.test/fineract-provider/api/v1/x").mock(side_effect=httpx.ReadTimeout("slow"))
+    c = FineractClient("https://f.test", "u", "p")
+    with pytest.raises(FineractError) as ei:
+        await c.get("/x")
+    assert ei.value.status == 0 and ei.value.body == {"error": "timeout"}
+
+
+def test_traffic_uses_a_15_second_request_timeout():
+    from harness_traffic import run as run_mod
+
+    assert run_mod.TRAFFIC_TIMEOUT_S == 15.0

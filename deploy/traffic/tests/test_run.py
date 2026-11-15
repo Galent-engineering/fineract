@@ -21,11 +21,11 @@ async def _no_sleep(_: float) -> None:
 
 @respx.mock
 async def test_exits_after_5_consecutive_failures(client, seed_result):
-    route = respx.post(f"{API}/clients").mock(return_value=httpx.Response(500, json={"e": 1}))
+    route = respx.post(f"{API}/clients").mock(return_value=httpx.Response(400, json={"e": 1}))
     with pytest.raises(SystemExit) as ei:
         await run(client, seed_result, error_rate=0, slow_rate=0, sleep=_no_sleep, rng=_Quiet())
     assert ei.value.code != 0
-    assert route.call_count == 5
+    assert route.call_count >= 5  # sets are launched on schedule, so a few more can be in flight when the 5th failure lands
 
 
 @respx.mock
@@ -34,7 +34,7 @@ async def test_auth_failure_counts_as_failure(client, seed_result):
     with pytest.raises(SystemExit) as ei:
         await run(client, seed_result, error_rate=0, slow_rate=0, sleep=_no_sleep, rng=_Quiet())
     assert ei.value.code == 1
-    assert route.call_count == 5
+    assert route.call_count >= 5
 
 
 @respx.mock
@@ -76,7 +76,7 @@ def _outcomes(monkeypatch, loans, injected=None):
 
 
 OK = JourneyOutcome("loan")
-BAD = JourneyOutcome("loan", error="HTTP 500", status=500)
+BAD = JourneyOutcome("loan", error="HTTP 400", status=400)
 
 
 async def test_four_failures_one_success_four_failures_keeps_running(client, seed_result, monkeypatch):
@@ -164,3 +164,58 @@ async def test_startup_retries_unexpected_exceptions_too(client):
         return None
 
     assert await run_mod.startup_seed(client, seed_fn=odd_seed, sleep=sleep) == "ok"
+
+
+# -------------------------------------------------------------------------- outage tolerance, schedule, in-flight cap
+
+import asyncio  # noqa: E402
+import time  # noqa: E402
+
+
+async def test_outage_failures_never_make_the_generator_exit(client, seed_result, monkeypatch):
+    outage = [JourneyOutcome("loan", error="HTTP 503", status=503)] * 6 + [JourneyOutcome("loan", error="timeout", status=0)] * 6
+    _outcomes(monkeypatch, outage)
+    await run(client, seed_result, error_rate=0, slow_rate=0, max_ticks=12, sleep=_no_sleep, rng=_Quiet())
+
+
+async def test_journey_log_reports_status_0_and_the_timeout_error(client, seed_result, monkeypatch, capsys):
+    _outcomes(monkeypatch, [JourneyOutcome("loan", error="timeout", status=0)])
+    await run(client, seed_result, error_rate=0, slow_rate=0, max_ticks=1, sleep=_no_sleep, rng=_Quiet())
+    line = [ln for ln in capsys.readouterr().out.splitlines() if '"journey"' in ln][0]
+    assert '"status": 0' in line and '"error": "timeout"' in line
+
+
+async def test_slow_responses_do_not_lower_the_launch_rate(client, seed_result, monkeypatch):
+    """Every journey takes 0.3 s but one is launched every 0.05 s: all 8 must start within ~0.4 s, not run back to back."""
+    starts: list[float] = []
+
+    async def slow_loan(_c, _s):
+        starts.append(time.monotonic())
+        await asyncio.sleep(0.3)
+        return OK
+
+    monkeypatch.setattr(run_mod, "run_loan_journey", slow_loan)
+    t0 = time.monotonic()
+    await run(client, seed_result, rate_per_min=1200, error_rate=0, slow_rate=0, max_ticks=8, rng=_Quiet())
+    assert len(starts) == 8
+    assert starts[-1] - t0 < 0.6  # sequential would need 7 x 0.3 s = 2.1 s before the last start
+
+
+async def test_in_flight_cap_skips_ticks_instead_of_piling_up(client, seed_result, monkeypatch, capsys):
+    running = {"now": 0, "max": 0}
+
+    async def hung_loan(_c, _s):
+        running["now"] += 1
+        running["max"] = max(running["max"], running["now"])
+        await asyncio.sleep(0.4)
+        running["now"] -= 1
+        return OK
+
+    monkeypatch.setattr(run_mod, "run_loan_journey", hung_loan)
+    await run(client, seed_result, rate_per_min=6000, error_rate=0, slow_rate=0, max_ticks=30, max_in_flight=3, rng=_Quiet())
+    assert running["max"] == 3
+    assert capsys.readouterr().out.count("tick_skipped") > 0
+
+
+async def test_default_cap_is_about_twenty():
+    assert 15 <= run_mod.MAX_IN_FLIGHT <= 25

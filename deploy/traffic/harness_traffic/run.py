@@ -38,6 +38,16 @@ async def _guard(journey: str, make: Callable[[], Awaitable[JourneyOutcome]]) ->
         return JourneyOutcome(journey, error=f"{type(exc).__name__}: {exc}")
 
 
+MAX_IN_FLIGHT = 20
+TRAFFIC_TIMEOUT_S = 15.0
+
+
+def _is_outage(o: JourneyOutcome) -> bool:
+    """A timeout (status 0) or a 5xx means the backend is down or degraded: that is what the harness is for, so it is
+    logged and counted by monitoring but never makes the generator exit (a restart would hide the outage)."""
+    return o.status is not None and (o.status == 0 or o.status >= 500)
+
+
 async def run(
     client: FineractClient,
     seed_result: SeedResult,
@@ -46,31 +56,23 @@ async def run(
     error_rate: float = 0.02,
     slow_rate: float = 0.01,
     max_ticks: int | None = None,
+    max_in_flight: int = MAX_IN_FLIGHT,
     rate_source: Callable[[], float] | None = None,
     rate_refresh_s: float = REFRESH_S,
     rate_timeout_s: float = READ_TIMEOUT_S,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
     rng: random.Random | None = None,
 ) -> None:
+    """Launches one journey set per tick ON SCHEDULE (every 60/rate seconds) without waiting for the previous one, so slow
+    or hung requests do not lower the offered rate. At most `max_in_flight` sets run at once; a tick that would exceed
+    the cap is skipped and logged."""
     rng = rng or random.Random()
     interval = 60.0 / rate_per_min
-    last_refresh = time.monotonic()
     loans: deque[int] = deque(maxlen=500)
-    failures = 0
-    tick = 0
-    while max_ticks is None or tick < max_ticks:
-        tick += 1
-        started = time.monotonic()
-        if rate_source is not None and started - last_refresh >= rate_refresh_s:
-            last_refresh = started
-            try:  # blocking boto3 call stays off the event loop, and never holds it past the timeout
-                new_rate = await asyncio.wait_for(asyncio.to_thread(rate_source), rate_timeout_s)
-            except asyncio.TimeoutError:
-                log("rate_fallback", reason="read timed out", rate=rate_per_min)
-                new_rate = rate_per_min
-            if new_rate != rate_per_min:
-                log("rate_change", old=rate_per_min, new=new_rate)
-                rate_per_min, interval = new_rate, 60.0 / new_rate
+    state = {"failures": 0, "fatal": False}
+    in_flight: set[asyncio.Task[None]] = set()
+
+    async def one_set() -> None:
         outcomes: list[JourneyOutcome] = []
         if rng.random() < error_rate:
             outcomes.append(await _guard("inject_error", lambda: inject_error(client)))  # expected 4xx: logged, not counted
@@ -87,14 +89,51 @@ async def run(
             outcomes.append(await _guard("repayment", lambda: run_repayment(client, loan_id)))
 
         for o in outcomes:
-            log("journey", journey=o.journey, status=o.status or 200, steps=len(o.steps), error=o.error, injected=o.injected)
+            log("journey", journey=o.journey, status=o.status if o.status is not None else 200, steps=len(o.steps),
+                error=o.error, injected=o.injected)
             if o.injected is True:
                 continue
-            failures = 0 if o.ok else failures + 1
-            if failures >= MAX_CONSECUTIVE_FAILURES:
-                log("fatal", reason=f"{failures} consecutive failures")
-                raise SystemExit(1)
-        await sleep(max(0.0, interval - (time.monotonic() - started)))  # keep the configured rate
+            if o.ok:
+                state["failures"] = 0
+            elif not _is_outage(o):  # auth/config style failures (4xx, unexpected exceptions) are fatal when they persist
+                state["failures"] += 1
+                if state["failures"] >= MAX_CONSECUTIVE_FAILURES:
+                    state["fatal"] = True
+
+    last_refresh = time.monotonic()
+    next_at = time.monotonic()
+    tick = 0
+    while (max_ticks is None or tick < max_ticks) and not state["fatal"]:
+        tick += 1
+        now = time.monotonic()
+        if rate_source is not None and now - last_refresh >= rate_refresh_s:
+            last_refresh = now
+            try:  # blocking boto3 call stays off the event loop, and never holds it past the timeout
+                new_rate = await asyncio.wait_for(asyncio.to_thread(rate_source), rate_timeout_s)
+            except asyncio.TimeoutError:
+                log("rate_fallback", reason="read timed out", rate=rate_per_min)
+                new_rate = rate_per_min
+            if new_rate != rate_per_min:
+                log("rate_change", old=rate_per_min, new=new_rate)
+                rate_per_min, interval = new_rate, 60.0 / new_rate
+        if len(in_flight) >= max_in_flight:
+            log("tick_skipped", reason="in_flight_cap", in_flight=len(in_flight), cap=max_in_flight)
+        else:
+            task = asyncio.ensure_future(one_set())
+            in_flight.add(task)
+            task.add_done_callback(in_flight.discard)
+        next_at += interval
+        delay = next_at - time.monotonic()
+        if delay < -interval:  # the scheduler itself stalled; do not fire a burst to catch up
+            next_at = time.monotonic()
+            delay = 0.0
+        await sleep(max(0.0, delay))
+        await asyncio.sleep(0)  # let freshly launched sets start even with an injected no-op sleep
+    if in_flight:
+        await asyncio.gather(*list(in_flight))
+    if state["fatal"]:
+        log("fatal", reason=f"{state['failures']} consecutive failures")
+        raise SystemExit(1)
 
 
 def _credentials(secret_arn: str) -> tuple[str, str]:
@@ -136,7 +175,7 @@ async def startup_seed(
 async def main_async() -> None:
     base = os.environ["FINERACT_BASE_URL"]
     username, password = _credentials(os.environ["SECRET_ARN"])
-    client = FineractClient(base, username, password)
+    client = FineractClient(base, username, password, timeout=TRAFFIC_TIMEOUT_S)
     seed_result = await startup_seed(client)
     fallback = env_rate()
     source = make_rate_source(fallback=fallback)

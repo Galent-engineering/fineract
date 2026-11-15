@@ -71,8 +71,8 @@ async def test_run_picks_up_a_new_rate_between_ticks(client, seed_result, monkey
 
     await run(client, seed_result, rate_per_min=6, error_rate=0, slow_rate=0, max_ticks=3, sleep=rec,
               rng=_Quiet(), rate_source=lambda: next(rates), rate_refresh_s=0)
-    # tick1 refresh->60 (1 s interval), tick2 ->60, tick3 ->6 (10 s), tick4: source exhausted would raise
-    assert [round(x) for x in sleeps[:3]] == [1, 1, 10]
+    # schedule-based pacing with a no-op sleep: the deadline advances 1 s, 1 s, then 10 s (60, 60, 6 per minute)
+    assert [round(x) for x in sleeps[:3]] == [1, 2, 12]
 
 
 def test_last_good_value_is_used_when_a_later_read_fails():
@@ -131,4 +131,4 @@ async def test_a_slow_rate_read_does_not_stall_the_loop(client, seed_result, mon
     await run(client, seed_result, rate_per_min=6, error_rate=0, slow_rate=0, max_ticks=2, sleep=rec, rng=_Quiet(),
               rate_source=slow, rate_refresh_s=0, rate_timeout_s=0.05)
     assert time.monotonic() - t0 < 0.9  # the loop did not wait out the 1 s read (2 ticks)
-    assert [round(x) for x in sleeps] == [10, 10]  # rate stayed at the current 6/min
+    assert [round(x) for x in sleeps] == [10, 20]  # deadline advances 10 s per tick: the rate stayed at 6/min

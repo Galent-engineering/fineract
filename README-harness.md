@@ -125,7 +125,7 @@ Break the harness on purpose, watch monitoring react, and let it recover by itse
 
 | Command | What it does | Duration |
 | --- | --- | --- |
-| `./demo.sh db-outage` | Fineract cannot reach Postgres (egress tcp 5432 blackholed). It keeps serving HTTP and answers 5xx. | 4 min |
+| `./demo.sh db-outage` | Fineract cannot reach Postgres (egress tcp 5432 blackholed). It keeps serving HTTP and fails fast: API calls return 5xx within seconds (JDBC connect timeout 5 s, socket timeout 10 s, pool wait 5 s) instead of hanging, and the traffic generator keeps its offered rate (15 s request timeout, up to 20 journeys in flight; timeouts are logged as status 0). It recovers by itself when the 4 minutes end. | 4 min |
 | `./demo.sh slowdown` | About 200 ms added to every outgoing packet of the Fineract task, database calls included, so a request slows by roughly 200 ms per database round trip. | 4 min |
 | `./demo.sh crash` | Stops the Fineract task; ECS starts a replacement (about 7-10 min until healthy). | until replaced |
 | `./demo.sh on` / `off` | Traffic rate 60 / 6 journeys per minute (SSM `/harness/traffic/rate_per_min`, read by the traffic task about once a minute, bounds 1..120). Prints the before and after value. | until changed |
@@ -140,6 +140,11 @@ Break the harness on purpose, watch monitoring react, and let it recover by itse
   sidecar (`amazon-ssm-agent`) that registers the task as an SSM managed instance (per the AWS FIS ECS task actions
   documentation). The sidecar runs `dnf upgrade` at start, which needs outbound internet (the tasks have public IPs).
   Turning this on rolls the Fineract task once.
+- The fail-fast database settings live in `fineract-env.ts` (store pool URL, `FINERACT_DEFAULT_TENANTDB_CONN_PARAMS`, a Hikari
+  settings file for the tenant pool). The tenant database's own parameters are read from the `tenant_server_connections` row,
+  which Fineract creates once, so for an existing deployment run the `harness-dbinit` one-off task again after deploying (it
+  updates that row idempotently, skipped before the first boot) and restart Fineract (`--force-new-deployment`) so the
+  pools are rebuilt. The traffic generator does not exit on 5xx or timeouts, only on persistent 4xx or unexpected errors.
 - Slowdown delays all egress of the Fineract task, database calls included, so every query pays the delay.
 - Cost: AWS FIS bills $0.10 per action-minute (one account, us-east-1; see https://aws.amazon.com/fis/pricing/), so a 4-minute
   scenario is about $0.40 and `crash` under $0.10. Nothing is billed while no experiment runs.

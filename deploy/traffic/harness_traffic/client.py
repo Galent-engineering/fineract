@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import datetime
 from typing import Any
 
@@ -12,7 +13,10 @@ API_PREFIX = "/fineract-provider/api/v1"
 
 class FineractError(Exception):
     def __init__(self, status: int, body: dict[str, Any]) -> None:
-        super().__init__(f"Fineract HTTP {status}: {str(body)[:300]}")
+        if status == 0 and body.get("error") == "timeout":
+            super().__init__("timeout")
+        else:
+            super().__init__(f"Fineract HTTP {status}: {str(body)[:300]}")
         self.status = status
         self.body = body
 
@@ -26,6 +30,7 @@ class FineractClient:
         tenant: str = "default",
         timeout: float = 120.0,
     ) -> None:
+        self._timeout = timeout
         self.base_url = base_url.rstrip("/")
         self._http = httpx.AsyncClient(
             base_url=self.base_url + API_PREFIX,
@@ -36,7 +41,10 @@ class FineractClient:
 
     async def _request(self, method: str, path: str, **kw: Any) -> dict[str, Any]:
         try:
-            resp = await self._http.request(method, path, **kw)
+            # httpx timeouts are per phase; wait_for makes `timeout` the cap for the whole request.
+            resp = await asyncio.wait_for(self._http.request(method, path, **kw), self._timeout)
+        except (httpx.TimeoutException, asyncio.TimeoutError) as exc:
+            raise FineractError(0, {"error": "timeout"}) from exc
         except httpx.HTTPError as exc:  # connection refused, timeout, ...
             raise FineractError(0, {"error": f"{type(exc).__name__}: {exc}"}) from exc
         try:
