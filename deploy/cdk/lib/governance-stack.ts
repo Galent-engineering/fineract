@@ -26,10 +26,13 @@ export interface ReaderStatement { actions: string[]; resources: string[]; condi
  * experiment-template (Service Authorization Reference for FIS).
  *  - Start on a template needs the template's harness-scenario tag to be one of the three scenario values.
  *  - Start/tag on a new experiment may only carry the two known tag keys, with a scenario value.
- *  - Stop needs the experiment to carry recovery-test-id and a scenario value, so it cannot stop an
- *    experiment that lacks both tags.
- * Residual risk: FIS cannot restrict TagResource to tag-on-create, so a holder of this role can retag an
- * existing experiment/* with an allowed scenario value; recovery-test-id presence on stop is the only guard.
+ *  - Stop needs the experiment to carry recovery-test-id and a scenario value.
+ * Accepted residual risk: FIS has no tag-on-create-only condition, so TagResource on experiment/* can be
+ * called on ANY experiment in this account (adding both tags, or overwriting recovery-test-id on another
+ * caller's experiment), and that experiment can then be stopped. So the stop condition is not a real
+ * boundary. Bounded impact: the role can start only the three tagged scenario templates and can never
+ * create or modify templates; stopping only ends a fault early (the safe direction); the credentials are
+ * held by the consuming service only.
  * No iam:PassRole: starting an experiment does not need it, the template already carries its role.
  */
 export function recoveryStatements(p: { account: string; region: string; partition: string }): ReaderStatement[] {
