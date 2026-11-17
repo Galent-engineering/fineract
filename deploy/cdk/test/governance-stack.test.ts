@@ -200,14 +200,16 @@ describe('recovery tester role', () => {
   const arr = (x: any): any[] => ([] as any[]).concat(x);
   const resStr = (s: any) => JSON.stringify(s.Resource);
   const withAction = (a: string) => stmts.filter((s) => arr(s.Action).includes(a));
-  const TAG_NULL = { Null: { 'aws:ResourceTag/harness-scenario': 'false' } };
 
   test('recovery tester trusts only the connector user with the external id', () => {
     expect(role.Properties.AssumeRolePolicyDocument.Statement).toHaveLength(1);
     const stmt = role.Properties.AssumeRolePolicyDocument.Statement[0];
     expect(stmt.Action).toBe('sts:AssumeRole');
     expect(stmt.Condition.StringEquals['sts:ExternalId']).toBeDefined();
-    expect(JSON.stringify(stmt.Principal)).toContain('ConnectorUser');
+    expect(Object.keys(stmt.Principal)).toEqual(['AWS']);
+    expect(stmt.Principal.AWS['Fn::GetAtt'][0]).toMatch(/^ConnectorUser[0-9A-F]+$/);
+    expect(stmt.Principal.AWS['Fn::GetAtt'][1]).toBe('Arn');
+    expect(stmt.Effect).toBe('Allow');
     expect(role.Properties.MaxSessionDuration).toBe(3600);
   });
 
@@ -219,25 +221,56 @@ describe('recovery tester role', () => {
     ].sort());
   });
 
-  test('start and stop are scoped to harness-scenario tagged resources', () => {
-    const start = withAction('fis:StartExperiment');
-    const onTemplate = start.find((s) => resStr(s).includes('experiment-template/*'))!;
-    expect(onTemplate.Condition).toEqual(TAG_NULL);
-    const onExperiment = start.find((s) => resStr(s).includes(':experiment/*'))!;
-    expect(arr(onExperiment.Action).sort()).toEqual(['fis:StartExperiment', 'fis:TagResource']);
+  const VALUES = ['db-outage', 'slowdown', 'crash'];
+  const NEW_EXP_COND = {
+    'ForAllValues:StringEquals': { 'aws:TagKeys': ['harness-scenario', 'recovery-test-id'] },
+    StringEquals: { 'aws:RequestTag/harness-scenario': VALUES },
+  };
+
+  test('start on a template requires a scenario tag with an allowed value', () => {
+    const s = withAction('fis:StartExperiment').find((x) => resStr(x).includes('experiment-template/*'))!;
+    expect(s.Condition).toEqual({ StringEquals: { 'aws:ResourceTag/harness-scenario': VALUES } });
+  });
+
+  test('start and tag on new experiments are limited to known tag keys and scenario values', () => {
+    const start = withAction('fis:StartExperiment').find((x) => resStr(x).includes(':experiment/*'))!;
+    expect(start.Condition).toEqual(NEW_EXP_COND);
+    const tag = withAction('fis:TagResource');
+    expect(tag).toHaveLength(1);
+    expect(resStr(tag[0])).toContain(':experiment/*');
+    expect(tag[0].Condition).toEqual(NEW_EXP_COND);
+  });
+
+  test('stop requires the test-id tag and a scenario value', () => {
     const stop = withAction('fis:StopExperiment');
     expect(stop).toHaveLength(1);
-    expect(stop[0].Condition).toEqual(TAG_NULL);
     expect(resStr(stop[0])).toContain(':experiment/*');
+    expect(stop[0].Condition).toEqual({
+      Null: { 'aws:ResourceTag/recovery-test-id': 'false' },
+      StringEquals: { 'aws:ResourceTag/harness-scenario': VALUES },
+    });
+  });
+
+  test('no write action has Resource "*"', () => {
     for (const s of stmts) {
       if (arr(s.Action).some((a) => /^fis:(Start|Stop|TagResource)/.test(a))) expect(arr(s.Resource)).not.toContain('*');
     }
   });
 
-  test('recovery tester has no non-FIS action', () => {
+  test('recovery tester has no non-FIS action, wildcard, NotAction, NotResource or PassRole', () => {
     for (const a of actionsOf(stmts)) expect(a.startsWith('fis:')).toBe(true);
     expect(actionsOf(stmts).filter((a) => a.includes('*'))).toEqual([]);
+    for (const s of stmts) {
+      expect(s.Effect).toBe('Allow');
+      expect(s.NotAction).toBeUndefined();
+      expect(s.NotResource).toBeUndefined();
+      expect(s.NotPrincipal).toBeUndefined();
+    }
     expect(JSON.stringify(stmts)).not.toContain('iam:PassRole');
+  });
+
+  test('exports the role arn', () => {
+    expect(Object.keys(t.findOutputs('RecoveryTesterRoleArn'))).toEqual(['RecoveryTesterRoleArn']);
   });
 });
 

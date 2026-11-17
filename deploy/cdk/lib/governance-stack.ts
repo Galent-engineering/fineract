@@ -15,23 +15,43 @@ export const ACCESS_KEY_SECRET = 'harness/reader/access-key';
 
 export const RECOVERY_ROLE_NAME = 'harness-recovery-tester';
 export const SCENARIO_TAG = 'harness-scenario';
+export const TEST_ID_TAG = 'recovery-test-id';
+export const SCENARIO_VALUES = ['db-outage', 'slowdown', 'crash'];
 
-export interface ReaderStatement { actions: string[]; resources: string[]; conditions?: Record<string, Record<string, string>> }
+export interface ReaderStatement { actions: string[]; resources: string[]; conditions?: Record<string, Record<string, string | string[]>> }
 
 /**
- * The recovery tester's whole policy: start/stop FIS experiments for harness-tagged scenarios only.
- * aws:ResourceTag/${TagKey} is supported on both fis experiment and experiment-template (Service
- * Authorization Reference for FIS). Null:false means "the tag is present". Stop is bounded by the same
- * harness-scenario tag (present on experiments the caller starts) so it cannot stop untagged experiments.
+ * The recovery tester's whole policy: start/stop FIS experiments for harness scenarios only.
+ * aws:ResourceTag, aws:RequestTag and aws:TagKeys are supported on both fis experiment and
+ * experiment-template (Service Authorization Reference for FIS).
+ *  - Start on a template needs the template's harness-scenario tag to be one of the three scenario values.
+ *  - Start/tag on a new experiment may only carry the two known tag keys, with a scenario value.
+ *  - Stop needs the experiment to carry recovery-test-id and a scenario value, so it cannot stop an
+ *    experiment that lacks both tags.
+ * Residual risk: FIS cannot restrict TagResource to tag-on-create, so a holder of this role can retag an
+ * existing experiment/* with an allowed scenario value; recovery-test-id presence on stop is the only guard.
  * No iam:PassRole: starting an experiment does not need it, the template already carries its role.
  */
 export function recoveryStatements(p: { account: string; region: string; partition: string }): ReaderStatement[] {
   const fisArn = `arn:${p.partition}:fis:${p.region}:${p.account}:`;
-  const tagged = { Null: { [`aws:ResourceTag/${SCENARIO_TAG}`]: 'false' } };
+  const newExperiment = {
+    'ForAllValues:StringEquals': { 'aws:TagKeys': [SCENARIO_TAG, TEST_ID_TAG] },
+    StringEquals: { [`aws:RequestTag/${SCENARIO_TAG}`]: SCENARIO_VALUES },
+  };
   return [
-    { actions: ['fis:StartExperiment'], resources: [`${fisArn}experiment-template/*`], conditions: tagged },
-    { actions: ['fis:StartExperiment', 'fis:TagResource'], resources: [`${fisArn}experiment/*`] },
-    { actions: ['fis:StopExperiment'], resources: [`${fisArn}experiment/*`], conditions: tagged },
+    {
+      actions: ['fis:StartExperiment'], resources: [`${fisArn}experiment-template/*`],
+      conditions: { StringEquals: { [`aws:ResourceTag/${SCENARIO_TAG}`]: SCENARIO_VALUES } },
+    },
+    { actions: ['fis:StartExperiment'], resources: [`${fisArn}experiment/*`], conditions: newExperiment },
+    { actions: ['fis:TagResource'], resources: [`${fisArn}experiment/*`], conditions: newExperiment },
+    {
+      actions: ['fis:StopExperiment'], resources: [`${fisArn}experiment/*`],
+      conditions: {
+        Null: { [`aws:ResourceTag/${TEST_ID_TAG}`]: 'false' },
+        StringEquals: { [`aws:ResourceTag/${SCENARIO_TAG}`]: SCENARIO_VALUES },
+      },
+    },
     {
       actions: ['fis:GetExperiment', 'fis:GetExperimentTemplate', 'fis:ListExperiments', 'fis:ListExperimentTemplates',
         'fis:ListActions', 'fis:GetAction', 'fis:ListTagsForResource'],
@@ -166,6 +186,7 @@ export class GovernanceStack extends cdk.Stack {
     });
 
     new cdk.CfnOutput(this, 'ReaderRoleArn', { value: this.readerRole.roleArn });
+    new cdk.CfnOutput(this, 'RecoveryTesterRoleArn', { value: this.recoveryRole.roleArn });
 
     // ---- AWS Config (account had no recorder) ------------------------------------------------
     const configBucket = new s3.Bucket(this, 'ConfigBucket', {
