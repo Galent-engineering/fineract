@@ -127,7 +127,7 @@ describe('reader role', () => {
 });
 
 describe('connector user', () => {
-  test('only policy is sts:AssumeRole on the reader role', () => {
+  test('only policy is sts:AssumeRole on exactly the reader and recovery roles', () => {
     t.hasResourceProperties('AWS::IAM::User', { UserName: 'harness-reliability-connector' });
     const userPolicies = (Object.values(t.findResources('AWS::IAM::Policy')) as any[]).filter((p) =>
       JSON.stringify(p.Properties.Users ?? []).includes('ConnectorUser'),
@@ -136,6 +136,10 @@ describe('connector user', () => {
     const stmts = userPolicies[0].Properties.PolicyDocument.Statement;
     expect(stmts).toHaveLength(1);
     expect(stmts[0].Action).toBe('sts:AssumeRole');
+    const res = JSON.stringify(stmts[0].Resource);
+    expect(stmts[0].Resource).toHaveLength(2);
+    expect(res).toContain('ReaderRole');
+    expect(res).toContain('RecoveryTesterRole');
   });
   test('secrets exist for external id and access key', () => {
     t.hasResourceProperties('AWS::SecretsManager::Secret', { Name: 'harness/reader/external-id' });
@@ -186,5 +190,61 @@ describe('config, resilience, fis', () => {
       const acts = Array.isArray(s.Action) ? s.Action : [s.Action];
       if (acts.some((a: string) => /Stop|Reboot/.test(a))) expect(JSON.stringify(s.Resource)).not.toBe('"*"');
     }
+  });
+});
+
+describe('recovery tester role', () => {
+  const role: any = roleOf('harness-recovery-tester');
+  const pol = policyFor('Roles', 'RecoveryTesterRole');
+  const stmts: any[] = pol.Properties.PolicyDocument.Statement;
+  const arr = (x: any): any[] => ([] as any[]).concat(x);
+  const resStr = (s: any) => JSON.stringify(s.Resource);
+  const withAction = (a: string) => stmts.filter((s) => arr(s.Action).includes(a));
+  const TAG_NULL = { Null: { 'aws:ResourceTag/harness-scenario': 'false' } };
+
+  test('recovery tester trusts only the connector user with the external id', () => {
+    expect(role.Properties.AssumeRolePolicyDocument.Statement).toHaveLength(1);
+    const stmt = role.Properties.AssumeRolePolicyDocument.Statement[0];
+    expect(stmt.Action).toBe('sts:AssumeRole');
+    expect(stmt.Condition.StringEquals['sts:ExternalId']).toBeDefined();
+    expect(JSON.stringify(stmt.Principal)).toContain('ConnectorUser');
+    expect(role.Properties.MaxSessionDuration).toBe(3600);
+  });
+
+  test('recovery tester holds exactly the approved FIS action set', () => {
+    expect([...actionsOf(stmts)].sort()).toEqual([
+      'fis:GetAction', 'fis:GetExperiment', 'fis:GetExperimentTemplate',
+      'fis:ListActions', 'fis:ListExperimentTemplates', 'fis:ListExperiments', 'fis:ListTagsForResource',
+      'fis:StartExperiment', 'fis:StartExperiment', 'fis:StopExperiment', 'fis:TagResource',
+    ].sort());
+  });
+
+  test('start and stop are scoped to harness-scenario tagged resources', () => {
+    const start = withAction('fis:StartExperiment');
+    const onTemplate = start.find((s) => resStr(s).includes('experiment-template/*'))!;
+    expect(onTemplate.Condition).toEqual(TAG_NULL);
+    const onExperiment = start.find((s) => resStr(s).includes(':experiment/*'))!;
+    expect(arr(onExperiment.Action).sort()).toEqual(['fis:StartExperiment', 'fis:TagResource']);
+    const stop = withAction('fis:StopExperiment');
+    expect(stop).toHaveLength(1);
+    expect(stop[0].Condition).toEqual(TAG_NULL);
+    expect(resStr(stop[0])).toContain(':experiment/*');
+    for (const s of stmts) {
+      if (arr(s.Action).some((a) => /^fis:(Start|Stop|TagResource)/.test(a))) expect(arr(s.Resource)).not.toContain('*');
+    }
+  });
+
+  test('recovery tester has no non-FIS action', () => {
+    for (const a of actionsOf(stmts)) expect(a.startsWith('fis:')).toBe(true);
+    expect(actionsOf(stmts).filter((a) => a.includes('*'))).toEqual([]);
+    expect(JSON.stringify(stmts)).not.toContain('iam:PassRole');
+  });
+});
+
+describe('public fork hygiene', () => {
+  test('fork carries no account id or product name', () => {
+    const json = JSON.stringify(t.toJSON()).replace(/111111111111/g, '');
+    expect(json).not.toMatch(/\b\d{12}\b/);
+    expect(json).not.toMatch(/galent|app ?mod|fineract-demo/i);
   });
 });

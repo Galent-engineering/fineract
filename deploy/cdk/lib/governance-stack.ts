@@ -13,7 +13,32 @@ export const CONNECTOR_USER_NAME = 'harness-reliability-connector';
 export const EXTERNAL_ID_SECRET = 'harness/reader/external-id';
 export const ACCESS_KEY_SECRET = 'harness/reader/access-key';
 
-export interface ReaderStatement { actions: string[]; resources: string[] }
+export const RECOVERY_ROLE_NAME = 'harness-recovery-tester';
+export const SCENARIO_TAG = 'harness-scenario';
+
+export interface ReaderStatement { actions: string[]; resources: string[]; conditions?: Record<string, Record<string, string>> }
+
+/**
+ * The recovery tester's whole policy: start/stop FIS experiments for harness-tagged scenarios only.
+ * aws:ResourceTag/${TagKey} is supported on both fis experiment and experiment-template (Service
+ * Authorization Reference for FIS). Null:false means "the tag is present". Stop is bounded by the same
+ * harness-scenario tag (present on experiments the caller starts) so it cannot stop untagged experiments.
+ * No iam:PassRole: starting an experiment does not need it, the template already carries its role.
+ */
+export function recoveryStatements(p: { account: string; region: string; partition: string }): ReaderStatement[] {
+  const fisArn = `arn:${p.partition}:fis:${p.region}:${p.account}:`;
+  const tagged = { Null: { [`aws:ResourceTag/${SCENARIO_TAG}`]: 'false' } };
+  return [
+    { actions: ['fis:StartExperiment'], resources: [`${fisArn}experiment-template/*`], conditions: tagged },
+    { actions: ['fis:StartExperiment', 'fis:TagResource'], resources: [`${fisArn}experiment/*`] },
+    { actions: ['fis:StopExperiment'], resources: [`${fisArn}experiment/*`], conditions: tagged },
+    {
+      actions: ['fis:GetExperiment', 'fis:GetExperimentTemplate', 'fis:ListExperiments', 'fis:ListExperimentTemplates',
+        'fis:ListActions', 'fis:GetAction', 'fis:ListTagsForResource'],
+      resources: ['*'],
+    },
+  ];
+}
 
 /**
  * The reader role's whole policy: read/query/describe only, scoped to the harness wherever AWS supports
@@ -83,6 +108,7 @@ export interface GovernanceStackProps extends cdk.StackProps {
  */
 export class GovernanceStack extends cdk.Stack {
   public readonly readerRole: iam.Role;
+  public readonly recoveryRole: iam.Role;
 
   constructor(scope: Construct, id: string, props: GovernanceStackProps) {
     super(scope, id, props);
@@ -114,7 +140,20 @@ export class GovernanceStack extends cdk.Stack {
       this.readerRole.addToPolicy(new iam.PolicyStatement(st));
     }
 
-    user.addToPolicy(new iam.PolicyStatement({ actions: ['sts:AssumeRole'], resources: [this.readerRole.roleArn] }));
+    this.recoveryRole = new iam.Role(this, 'RecoveryTesterRole', {
+      roleName: RECOVERY_ROLE_NAME,
+      assumedBy: new iam.ArnPrincipal(user.userArn).withConditions({
+        StringEquals: { 'sts:ExternalId': externalId.secretValue.unsafeUnwrap() },
+      }),
+      maxSessionDuration: cdk.Duration.hours(1),
+    });
+    for (const st of recoveryStatements({ account: this.account, region: this.region, partition: this.partition })) {
+      this.recoveryRole.addToPolicy(new iam.PolicyStatement(st));
+    }
+
+    user.addToPolicy(new iam.PolicyStatement({
+      actions: ['sts:AssumeRole'], resources: [this.readerRole.roleArn, this.recoveryRole.roleArn],
+    }));
 
     const accessKey = new iam.AccessKey(this, 'ConnectorAccessKey', { user });
     new secretsmanager.Secret(this, 'AccessKeySecret', {
