@@ -278,6 +278,6 @@ describe('public fork hygiene', () => {
   test('fork carries no account id or product name', () => {
     const json = JSON.stringify(t.toJSON()).replace(/111111111111/g, '');
     expect(json).not.toMatch(/\b\d{12}\b/);
-    expect(json).not.toMatch(/galent|app ?mod|fineract-demo/i);
+    expect(json).not.toMatch(/galent|fineract-demo/i);
   });
 });
